@@ -129,8 +129,32 @@ export function buildExterior(scene, M) {
 // Interior
 // ---------------------------------------------------------------------------
 
-/** Everything inside the store. Returns { batches, counter }. tier: QUALITY object (product shadows for ultra/high). */
-export function buildInterior(scene, M, tier) {
+/** Split `total` bays over the zones that have catalog items: every zone gets >= 1 (when possible), rest by item count. */
+function allocateBays(zones, counts, total) {
+  const act = zones.filter((z) => counts[z] > 0);
+  if (!act.length) return null;
+  const n = act.map((z) => (total >= act.length ? 1 : 0));
+  let left = total - n.reduce((a, b) => a + b, 0);
+  const sum = act.reduce((a, z) => a + counts[z], 0);
+  const want = act.map((z) => (counts[z] / sum) * total);
+  while (left > 0) { // largest deficit first
+    let bi = 0, bd = -1e9;
+    act.forEach((z, i) => { const d = want[i] - n[i]; if (d > bd) { bd = d; bi = i; } });
+    n[bi]++; left--;
+  }
+  const out = [];
+  act.forEach((z, i) => { for (let k = 0; k < n[i]; k++) out.push(z); });
+  return out.slice(0, total);
+}
+
+/**
+ * Everything inside the store. Returns { batches, counter }. tier: QUALITY object (product shadows for
+ * ultra/high). opts.catalog = { texture, cells, items:[{cell, shape, zone, id, title, w?, h?, d?}] } stocks
+ * real products: candy = left wall + left-front gondola, chips/cookies/chocolate = right wall (chips nearest
+ * the entrance), noodles/cereal/pickles = back wall, new = right gondola, drinks = cooler. Without it the
+ * generated label atlas is used.
+ */
+export function buildInterior(scene, M, tier, opts = {}) {
   const g = new THREE.Group(); g.name = 'interior'; scene.add(g);
   const Wd = 8, D = 11, Hh = 3.4, lowerH = 2.3;
   const productShadows = !!tier && (tier.name === 'ultra' || tier.name === 'high' || tier.productShadows === true);
@@ -174,13 +198,23 @@ export function buildInterior(scene, M, tier) {
 
   // furniture
   const batches = new ProductBatches(M, 20261120);
+  const cat = opts.catalog && opts.catalog.items && opts.catalog.items.length ? opts.catalog : null;
+  let leftZones, rightZones, backZones;
+  if (cat) {
+    batches.setCatalog(cat);
+    const counts = {};
+    for (const it of cat.items) counts[it.zone] = (counts[it.zone] || 0) + 1;
+    leftZones = allocateBays(['candy'], counts, 5);
+    rightZones = allocateBays(['chips', 'cookies', 'chocolate'], counts, 6);
+    backZones = allocateBays(['noodles', 'cereal', 'pickles'], counts, 4);
+  }
   const V = (x, y, z) => new THREE.Vector3(x, y, z);
-  wallShelves(g, M, batches, V(-4, 0, -4.3), V(0, 0, -1), 6.2, V(1, 0, 0), { zone: 'left' });
-  wallShelves(g, M, batches, V(4, 0, -0.4), V(0, 0, -1), 7.5, V(-1, 0, 0), { zone: 'right' });
-  wallShelves(g, M, batches, V(-3.9, 0, -11), V(1, 0, 0), 2.3, V(0, 0, 1), { zone: 'back' });
-  wallShelves(g, M, batches, V(1.6, 0, -11), V(1, 0, 0), 2.3, V(0, 0, 1), { zone: 'back' });
-  gondola(g, M, batches, -1.4, -3.2, 1.8, 'gondolaA');
-  gondola(g, M, batches, 1.4, -5.8, 1.8, 'gondolaB');
+  wallShelves(g, M, batches, V(-4, 0, -4.3), V(0, 0, -1), 6.2, V(1, 0, 0), { zone: 'left', bayZones: leftZones });
+  wallShelves(g, M, batches, V(4, 0, -0.4), V(0, 0, -1), 7.5, V(-1, 0, 0), { zone: 'right', bayZones: rightZones });
+  wallShelves(g, M, batches, V(-3.9, 0, -11), V(1, 0, 0), 2.3, V(0, 0, 1), { zone: 'back', bayZones: backZones?.slice(0, 2) });
+  wallShelves(g, M, batches, V(1.6, 0, -11), V(1, 0, 0), 2.3, V(0, 0, 1), { zone: 'back', bayZones: backZones?.slice(2, 4) });
+  gondola(g, M, batches, -1.4, -3.2, 1.8, 'gondolaA', cat ? 'candy' : undefined);
+  gondola(g, M, batches, 1.4, -5.8, 1.8, 'gondolaB', cat ? 'new' : undefined);
   freezer(g, M, -3.4, -1.6, batches);
   cooler(g, M, batches, 3.6, -9.3);
   const ctr = counter(g, M, -0.3, -10.0, batches);

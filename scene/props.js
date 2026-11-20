@@ -28,7 +28,6 @@ import { mergeGeometries } from 'three/addons/utils/BufferGeometryUtils.js';
 const PI = Math.PI;
 const Y_AXIS = new THREE.Vector3(0, 1, 0);
 const CELLS = 4;
-const LABEL_INSET = 1 / 128;
 
 // ---------------------------------------------------------------------------
 // Utilities
@@ -71,22 +70,28 @@ function shade(color, f) { _col2.set(color); _col2.multiplyScalar(f); return _co
 
 // ---- label shader patch --------------------------------------------------------------------
 
-function patchLabelMaterial(mat) {
-  if (!mat || mat.userData.uvCellPatched) return;
-  mat.userData.uvCellPatched = true;
+const _labelPatched = new WeakSet();
+function patchLabelMaterial(mat, cells = CELLS) {
+  if (!mat || _labelPatched.has(mat)) return;
+  _labelPatched.add(mat);
+  const cs = (1 / cells).toFixed(7), inset = (1 / (cells * 32)).toFixed(7);
   const prev = mat.onBeforeCompile;
   mat.onBeforeCompile = function (shader, renderer) {
     if (prev) prev.call(this, shader, renderer);
     shader.vertexShader = shader.vertexShader
-      .replace('#include <common>', '#include <common>\nattribute vec2 uvCell;')
+      .replace('#include <common>', '#include <common>\nattribute vec2 uvCell;\nattribute float uvHl;\nvarying float vHl;')
       .replace('#include <uv_vertex>', `#include <uv_vertex>
+  vHl = uvHl;
 #if defined( USE_MAP ) && defined( USE_INSTANCING )
-  vMapUv = vMapUv * ( 0.25 - 2.0 * ${LABEL_INSET.toFixed(6)} ) + ${LABEL_INSET.toFixed(6)} + uvCell;
+  vMapUv = vMapUv * ( ${cs} - 2.0 * ${inset} ) + ${inset} + uvCell;
 #endif`);
-    // the label texel is never tinted by the instance colour
-    shader.fragmentShader = shader.fragmentShader.replace('#include <color_fragment>', '');
+    // the photo/label is not tinted by the instance colour (the sides use M.product with it);
+    // only the per-instance highlight attribute brightens it
+    shader.fragmentShader = shader.fragmentShader
+      .replace('#include <common>', '#include <common>\nvarying float vHl;')
+      .replace('#include <color_fragment>', 'diffuseColor.rgb *= 1.0 + vHl * 0.8;');
   };
-  mat.customProgramCacheKey = () => 'labels-uvoff-v1';
+  mat.customProgramCacheKey = () => (cells === CELLS ? 'labels-uvoff-v1' : `labels-uvoff-v1-c${cells}`);
   mat.needsUpdate = true;
 }
 
@@ -314,6 +319,14 @@ function makeGableGeometry() {
   g.clearGroups();
   return g;
 }
+/** Noodle cup 0.093 x 0.1 (truncated cylinder): group 0 side label, 1 base, 2 foil lid. */
+function makeCupGeometry() {
+  const seg = 12;
+  const label = lathe([[0.0335, 0.008], [0.0445, 0.092]], seg, true);
+  const base = lathe([[0.0001, 0], [0.030, 0], [0.0335, 0.008]], seg);
+  const lid = lathe([[0.0445, 0.092], [0.0468, 0.0955], [0.0468, 0.1], [0.0001, 0.1]], seg);
+  return mergeGeometries([label, base, lid], true);
+}
 function makeBlockGeometry() { return new THREE.BoxGeometry(1, 1, 1).translate(0, 0.5, 0); }
 function makeCandyGeometry() { return new THREE.SphereGeometry(0.5, 6, 4); }
 
@@ -325,38 +338,90 @@ function makeCandyGeometry() { return new THREE.SphereGeometry(0.5, 6, 4); }
 const _q1 = new THREE.Quaternion(), _q2 = new THREE.Quaternion(), _e = new THREE.Euler();
 const _v1 = new THREE.Vector3(), _v2 = new THREE.Vector3(), _s = new THREE.Vector3(), _p = new THREE.Vector3(), _m = new THREE.Matrix4();
 
+function hashStr(s) {
+  let h = 2166136261;
+  for (let i = 0; i < s.length; i++) { h ^= s.charCodeAt(i); h = Math.imul(h, 16777619); }
+  return h >>> 0;
+}
+const MUTED = ['#c9a27a', '#9db4a0', '#b88a8a', '#8fa6c0', '#c7b27a', '#a891b5', '#d19a76', '#86a8a6', '#c08fa0', '#a3b58a', '#b5a58f', '#7f95b8'];
+/** Deterministic muted colour for a catalog item (bag edges / bottle body roughly match the photo). */
+function itemColor(item) { return MUTED[hashStr(String(item.id)) % MUTED.length]; }
+
+const PICKABLE = new Set(['bag', 'box', 'bottle', 'can', 'tube', 'cup']);
+const HL_GAIN = 1.5;
+
 export class ProductBatches {
   constructor(M, seed = 20261120) {
     this.M = M;
     this.rnd = makeRng(seed);
-    patchLabelMaterial(M.labels);
+    patchLabelMaterial(M.labels, CELLS);
     const cap = untinted(M.white), steel = untinted(M.steel);
+    this._cap = cap; this._steel = steel;
     this.geo = {
       bag: makeBagGeometry(), box: makeBoxGeometry(), bottle: makeBottleGeometry(), can: makeCanGeometry(),
-      tube: makeTubeGeometry(), gable: makeGableGeometry(), candy: makeCandyGeometry(), block: makeBlockGeometry(),
+      tube: makeTubeGeometry(), cup: makeCupGeometry(), gable: makeGableGeometry(), candy: makeCandyGeometry(),
+      block: makeBlockGeometry(),
     };
     this.jarGeometry = new THREE.CylinderGeometry(0.1, 0.1, 0.26, 24, 1, false); // glass jar (counter)
     this.mats = {
       bag: [M.labels, M.product], box: [M.labels, M.product], bottle: [M.product, M.labels, cap],
-      can: [M.labels, steel], tube: [M.labels, steel, cap], gable: M.black, candy: M.product, block: M.product,
+      can: [M.labels, steel], tube: [M.labels, steel, cap], cup: [M.labels, steel, cap],
+      gable: M.black, candy: M.product, block: M.product,
     };
+    this.catalog = null; this.catMats = null; this.byZone = new Map(); this._cursor = new Map();
     this.zone = 'main';
     this.data = new Map();
-    this.meshes = [];
+    this.meshes = [];          // every product InstancedMesh
+    this.productMeshes = [];   // the pickable ones (bags, boxes, bottles, cans, tubes, cups)
+    this.itemInst = new Map(); // catalog item -> [{ mesh, i }]
     this.group = null;
+    // pick / highlight scratch (allocated once)
+    this._hits = [];
+    this._pickResult = { item: null, point: new THREE.Vector3(), distance: 0, mesh: null, instanceId: -1 };
+    this._hl = null; this._hlN = 0;
+    this._single = { mesh: null, i: 0 }; this._singleList = [this._single];
   }
 
   setZone(name) { this.zone = name; return this; }
 
-  _entry(kind) {
-    const key = `${this.zone}|${kind}`;
+  /**
+   * Use a real-product atlas: { texture, cells, items:[{cell, shape, zone, id, title, w?, h?, d?}] }.
+   * Cell i -> col = i % cells, row = floor(i / cells) from the TOP of the image. Call before placing
+   * products (fillRun takes items per zone, in order, cycling).
+   */
+  setCatalog(cat) {
+    this.catalog = cat; this.byZone.clear(); this._cursor.clear();
+    for (const it of cat.items) {
+      let a = this.byZone.get(it.zone); if (!a) { a = []; this.byZone.set(it.zone, a); } a.push(it);
+    }
+    const lab = this.M.labels.clone();
+    lab.map = cat.texture;
+    patchLabelMaterial(lab, cat.cells);
+    this.catLabel = lab;
+    const { M, _cap: cap, _steel: steel } = this;
+    this.catMats = {
+      bag: [lab, M.product], box: [lab, M.product], bottle: [M.product, lab, cap],
+      can: [lab, steel], tube: [lab, steel, cap], cup: [lab, steel, cap],
+    };
+    return this;
+  }
+  hasCatalogZone(z) { return !!z && this.byZone.has(z); }
+  /** Next catalog item of a zone, in order, cycling; null when the zone has none. */
+  nextItem(z) {
+    const a = this.byZone.get(z); if (!a) return null;
+    const c = this._cursor.get(z) || 0; this._cursor.set(z, c + 1);
+    return a[c % a.length];
+  }
+
+  _entry(kind, cat) {
+    const key = `${this.zone}|${kind}|${cat ? 'c' : 'g'}`;
     let d = this.data.get(key);
-    if (!d) { d = { zone: this.zone, kind, m: [], c: [], u: [], n: 0 }; this.data.set(key, d); }
+    if (!d) { d = { zone: this.zone, kind, cat, m: [], c: [], u: [], items: [], n: 0 }; this.data.set(key, d); }
     return d;
   }
 
-  _add(kind, x, y, z, ry, sx, sy, sz, lean, roll, pivotZ, color, cell) {
-    const d = this._entry(kind);
+  _add(kind, x, y, z, ry, sx, sy, sz, lean, roll, pivotZ, color, cell, item = null) {
+    const d = this._entry(kind, !!(item && this.catalog));
     _q1.setFromEuler(_e.set(-lean, 0, roll, 'XYZ'));
     _q2.setFromAxisAngle(Y_AXIS, ry);
     _v1.set(0, 0, pivotZ);
@@ -370,29 +435,39 @@ export class ProductBatches {
     for (let i = 0; i < 16; i++) d.m.push(e[i]);
     _col.set(color);
     d.c.push(_col.r, _col.g, _col.b);
-    const ci = cell === undefined ? this.rnd.int(16) : cell & 15;
-    d.u.push((ci % CELLS) / CELLS, (CELLS - 1 - Math.floor(ci / CELLS)) / CELLS);
+    if (d.cat) {
+      const N = this.catalog.cells, ci = item.cell;
+      d.u.push((ci % N) / N, (N - 1 - Math.floor(ci / N)) / N);
+    } else {
+      const ci = cell === undefined ? this.rnd.int(16) : cell & 15;
+      d.u.push((ci % CELLS) / CELLS, (CELLS - 1 - Math.floor(ci / CELLS)) / CELLS);
+    }
+    d.items.push(d.cat ? item : null);
     d.n++;
   }
 
   /** x,y,z = bottom-centre (y is the surface it stands on); ry = yaw; lean (rad, backwards) and roll optional. */
-  addBag(x, y, z, ry, w, h, d, color, cell, lean = 0.105, roll = 0) {
-    this._add('bag', x, y, z, ry, w, h, d, lean, roll, -d / 2, color, cell);
+  addBag(x, y, z, ry, w, h, d, color, cell, lean = 0.105, roll = 0, item = null) {
+    this._add('bag', x, y, z, ry, w, h, d, lean, roll, -d / 2, color, cell, item);
   }
-  addBox(x, y, z, ry, w, h, d, color, cell, lean = 0, roll = 0) {
-    this._add('box', x, y, z, ry, w, h, d, lean, roll, -d / 2, color, cell);
+  addBox(x, y, z, ry, w, h, d, color, cell, lean = 0, roll = 0, item = null) {
+    this._add('box', x, y, z, ry, w, h, d, lean, roll, -d / 2, color, cell, item);
   }
   /** 0.065 m wide, 0.23 m tall at scale 1; colour tints the liquid. cell/ry optional. */
-  addBottle(x, y, z, color, scale = 1, cell, ry = 0) {
-    this._add('bottle', x, y, z, ry, scale, scale, scale, 0, 0, 0, color, cell);
+  addBottle(x, y, z, color, scale = 1, cell, ry = 0, item = null) {
+    this._add('bottle', x, y, z, ry, scale, scale, scale, 0, 0, 0, color, cell, item);
   }
   /** 0.066 x 0.123 */
-  addCan(x, y, z, color, cell, ry = 0, scale = 1) {
-    this._add('can', x, y, z, ry, scale, scale, scale, 0, 0, 0, color, cell);
+  addCan(x, y, z, color, cell, ry = 0, scale = 1, item = null) {
+    this._add('can', x, y, z, ry, scale, scale, scale, 0, 0, 0, color, cell, item);
   }
   /** chip canister 0.075 x 0.235 */
   addTube(x, y, z, ry, scale, color, cell) {
     this._add('tube', x, y, z, ry, scale, scale, scale, 0, 0, 0, color, cell);
+  }
+  /** noodle cup, truncated cylinder 0.093 x 0.1 at scale 1, photo on the side */
+  addCup(x, y, z, ry, scale, color, cell, item = null) {
+    this._add('cup', x, y, z, ry, scale, scale, scale, 0, 0, 0, color, cell, item);
   }
   /** black gable mystery box, w x h (incl. roof) x d, front +Z */
   addGable(x, y, z, ry, w, h, d) {
@@ -407,24 +482,84 @@ export class ProductBatches {
     this._add('candy', x, y - 0.0, z, ry, 0.04 * s, 0.022 * s, 0.026 * s, 0, 0, 0, color, 0);
   }
 
-  /** Create the InstancedMeshes (one per zone and kind). castShadow=false skips the shadow pass for products. */
+  /** Create the InstancedMeshes (one per zone, kind and source). castShadow=false skips the shadow pass for products. */
   build(scene, castShadow = true) {
     const group = new THREE.Group(); group.name = 'products';
     for (const d of this.data.values()) {
       if (!d.n) continue;
       const geo = this.geo[d.kind].clone();
       geo.setAttribute('uvCell', new THREE.InstancedBufferAttribute(new Float32Array(d.u), 2));
-      const im = new THREE.InstancedMesh(geo, this.mats[d.kind], d.n);
+      geo.setAttribute('uvHl', new THREE.InstancedBufferAttribute(new Float32Array(d.n), 1));
+      const im = new THREE.InstancedMesh(geo, d.cat ? this.catMats[d.kind] : this.mats[d.kind], d.n);
       im.instanceMatrix.array.set(d.m); im.instanceMatrix.needsUpdate = true;
       im.instanceColor = new THREE.InstancedBufferAttribute(new Float32Array(d.c), 3);
+      im.baseColors = new Float32Array(d.c);
+      im.instanceItems = d.items;
       im.computeBoundingSphere(); im.computeBoundingBox();
       im.castShadow = castShadow; im.receiveShadow = true; im.frustumCulled = true;
-      im.name = `${d.zone}:${d.kind}`;
+      im.name = `${d.zone}:${d.kind}${d.cat ? ':cat' : ''}`;
       group.add(im); this.meshes.push(im);
+      if (PICKABLE.has(d.kind)) this.productMeshes.push(im);
+      if (d.cat) {
+        for (let i = 0; i < d.n; i++) {
+          const it = d.items[i];
+          let list = this.itemInst.get(it); if (!list) { list = []; this.itemInst.set(it, list); }
+          list.push({ mesh: im, i });
+        }
+      }
     }
     scene.add(group);
     this.group = group;
     return group;
+  }
+
+  /**
+   * Nearest product under the ray. Returns a REUSED object { item, point, distance, mesh, instanceId }
+   * (copy what you need) or null; null also when the nearest hit is a generated (non-catalog) product.
+   * Allocation-free apart from three's own Intersection objects for actual hits.
+   */
+  pick(raycaster) {
+    const hits = this._hits; hits.length = 0;
+    const pm = this.productMeshes;
+    for (let k = 0; k < pm.length; k++) pm[k].raycast(raycaster, hits);
+    let best = null;
+    for (let i = 0; i < hits.length; i++) if (!best || hits[i].distance < best.distance) best = hits[i];
+    if (!best) return null;
+    const item = best.object.instanceItems[best.instanceId];
+    if (!item) { hits.length = 0; return null; }
+    const r = this._pickResult;
+    r.item = item; r.point.copy(best.point); r.distance = best.distance; r.mesh = best.object; r.instanceId = best.instanceId;
+    hits.length = 0;
+    return r;
+  }
+
+  _setHl(list, n, on) {
+    for (let k = 0; k < n; k++) {
+      const e = list[k], im = e.mesh, i = e.i, c = im.instanceColor.array, b = im.baseColors;
+      const g = on ? HL_GAIN : 1;
+      c[i * 3] = b[i * 3] * g; c[i * 3 + 1] = b[i * 3 + 1] * g; c[i * 3 + 2] = b[i * 3 + 2] * g;
+      const hl = im.geometry.attributes.uvHl;
+      hl.array[i] = on ? 1 : 0;
+      im.instanceColor.needsUpdate = true; hl.needsUpdate = true;
+    }
+  }
+  /**
+   * highlight(item): brighten every instance of that catalog item; highlight(pickResult): only the picked
+   * instance; highlight(null) clears. Restores the previous highlight. No allocations.
+   */
+  highlight(x) {
+    if (this._hl) this._setHl(this._hl, this._hlN, false);
+    this._hl = null; this._hlN = 0;
+    if (!x) return;
+    if (x.mesh && x.instanceId >= 0) {
+      this._single.mesh = x.mesh; this._single.i = x.instanceId;
+      this._hl = this._singleList; this._hlN = 1;
+    } else {
+      const list = this.itemInst.get(x);
+      if (!list) return;
+      this._hl = list; this._hlN = list.length;
+    }
+    this._setHl(this._hl, this._hlN, true);
   }
 
   /** { instances, triangles, meshes } of the built (or pending) batches. */
@@ -449,6 +584,31 @@ function pickKind(mix, rnd) {
   let t = rnd() * total;
   for (const k in mix) { t -= mix[k]; if (t <= 0) return k; }
   return 'bag';
+}
+
+function specFromItem(item, rnd, maxH) {
+  const k = ['bag', 'box', 'bottle', 'can', 'cup'].includes(item.shape) ? item.shape : 'box';
+  const sp = { kind: k, item, color: itemColor(item), cell: item.cell, jitter: 0.1, lean: 0, gap: 0.006 };
+  if (k === 'bag') {
+    const chips = item.zone === 'chips';
+    sp.w = item.w ?? (chips ? rnd.range(0.14, 0.19) : rnd.range(0.11, 0.15));
+    sp.h = item.h ?? (chips ? rnd.range(0.2, 0.26) : rnd.range(0.17, 0.22));
+    sp.d = item.d ?? rnd.range(0.045, chips ? 0.075 : 0.06);
+    sp.h = Math.min(sp.h, maxH); sp.lean = rnd.range(0.09, 0.12); sp.pitch = sp.d * 1.04 + 0.004;
+  } else if (k === 'box') {
+    sp.w = item.w ?? rnd.range(0.09, 0.14); sp.h = Math.min(item.h ?? rnd.range(0.12, 0.18), maxH);
+    sp.d = item.d ?? rnd.range(0.04, 0.07); sp.lean = rnd.range(0, 0.04); sp.pitch = sp.d + 0.004;
+  } else if (k === 'cup') {
+    const s = Math.min(item.h ? item.h / 0.1 : item.w ? item.w / 0.093 : rnd.range(0.95, 1.1), maxH / 0.1);
+    sp.scale = s; sp.w = 0.093 * s; sp.h = 0.1 * s; sp.d = sp.w; sp.pitch = sp.w + 0.003; sp.gap = 0.003; sp.jitter = 0.5;
+  } else if (k === 'bottle') {
+    const s = Math.min(item.h ? item.h / 0.23 : rnd.range(0.95, 1.1), maxH / 0.23);
+    sp.scale = s; sp.w = 0.065 * s; sp.h = 0.23 * s; sp.d = sp.w; sp.pitch = sp.w + 0.002; sp.gap = 0.002; sp.jitter = 0.5;
+  } else { // can
+    const s = Math.min(item.h ? item.h / 0.123 : 1, maxH / 0.123);
+    sp.scale = s; sp.w = 0.066 * s; sp.h = 0.123 * s; sp.d = sp.w; sp.pitch = sp.w + 0.002; sp.gap = 0.002; sp.jitter = 0.5;
+  }
+  return sp;
 }
 
 function makeSpec(kind, rnd, maxH, opts) {
@@ -482,22 +642,27 @@ function makeSpec(kind, rnd, maxH, opts) {
  * Fill one shelf board with facings. `start` is on the wall line at the start of the run (world),
  * `dir` runs along the shelf, `out` points away from the wall (the product front), `y` is the shelf
  * top surface. opts: depth (wall line to shelf front, default 0.36), margin, frontInset, backClear,
- * maxH, mix {kind: weight}, rows (fixed row count; default 2 with a 10% chance of 3),
- * bottleScale [min,max], backfill (default true: a cheap block fills the depth behind the rows).
+ * maxH, mix {kind: weight}, rows (fixed row count; default 2 with a 10% chance of 3, 1 for bottles/cans/cups),
+ * bottleScale [min,max], backfill (default true: a cheap block fills the depth behind the rows),
+ * catZone (catalog zone: each facing takes the next catalog item of that zone, cycling; generated
+ * products when the catalog has none for it).
  */
 export function fillRun(batches, start, dir, length, out, y, kind = 'mixed', opts = {}) {
   const rnd = batches.rnd;
   const depth = opts.depth ?? 0.36, margin = opts.margin ?? 0.012, inset = opts.frontInset ?? 0.012;
   const backClear = opts.backClear ?? 0.025, maxH = opts.maxH ?? 0.31, mix = opts.mix ?? DEFAULT_MIX;
   const ry0 = Math.atan2(out.x, out.z);
+  const catZone = opts.catZone && batches.hasCatalogZone(opts.catZone) ? opts.catZone : null;
   const uEnd = length - margin;
   let u = margin;
   const at = (cu, v) => [start.x + dir.x * cu + out.x * v, start.z + dir.z * cu + out.z * v];
   while (u < uEnd - 0.04) {
-    const k = kind === 'mixed' ? pickKind(mix, rnd) : kind;
-    const sp = makeSpec(k, rnd, maxH, opts);
-    const across = (k === 'bag' && sp.w > 0.17) ? 1 + rnd.int(2) : 1 + rnd.int(k === 'bottle' || k === 'can' ? 5 : 3);
-    const rowsWanted = opts.rows ?? (rnd() < 0.1 ? 3 : 2);
+    const item = catZone ? batches.nextItem(catZone) : null;
+    const sp = item ? specFromItem(item, rnd, maxH) : makeSpec(kind === 'mixed' ? pickKind(mix, rnd) : kind, rnd, maxH, opts);
+    const k = sp.kind;
+    const across = item ? 1 + rnd.int(k === 'bottle' || k === 'can' ? 3 : 2)
+      : (k === 'bag' && sp.w > 0.17) ? 1 + rnd.int(2) : 1 + rnd.int(k === 'bottle' || k === 'can' ? 5 : 3);
+    const rowsWanted = opts.rows ?? ((k === 'bottle' || k === 'can' || k === 'cup') ? 1 : (rnd() < 0.1 ? 3 : 2));
     const blockStart = u; let rowsMax = 0, placedAny = false;
     for (let a = 0; a < across; a++) {
       if (u + sp.w > uEnd) break;
@@ -508,10 +673,11 @@ export function fillRun(batches, start, dir, length, out, y, kind = 'mixed', opt
         const [px, pz] = at(cu, vf - sp.d / 2);
         const yaw = ry0 + (rnd() - 0.5) * sp.jitter;
         const hj = (rnd() - 0.5) * 0.006;
-        if (k === 'bag') batches.addBag(px, y, pz, yaw, sp.w, sp.h + hj, sp.d, sp.color, sp.cell, sp.lean * rnd.range(0.8, 1.2), (rnd() - 0.5) * 0.02);
-        else if (k === 'box') batches.addBox(px, y, pz, yaw, sp.w, sp.h + hj, sp.d, sp.color, sp.cell, sp.lean * rnd.range(0.5, 1.2), 0);
-        else if (k === 'bottle') batches.addBottle(px, y, pz, sp.color, sp.scale, sp.cell, yaw);
-        else if (k === 'can') batches.addCan(px, y, pz, sp.color, sp.cell, yaw, sp.scale);
+        if (k === 'bag') batches.addBag(px, y, pz, yaw, sp.w, sp.h + hj, sp.d, sp.color, sp.cell, sp.lean * rnd.range(0.8, 1.2), (rnd() - 0.5) * 0.02, sp.item);
+        else if (k === 'box') batches.addBox(px, y, pz, yaw, sp.w, sp.h + hj, sp.d, sp.color, sp.cell, sp.lean * rnd.range(0.5, 1.2), 0, sp.item);
+        else if (k === 'bottle') batches.addBottle(px, y, pz, sp.color, sp.scale, sp.cell, yaw, sp.item);
+        else if (k === 'can') batches.addCan(px, y, pz, sp.color, sp.cell, yaw, sp.scale, sp.item);
+        else if (k === 'cup') batches.addCup(px, y, pz, yaw, sp.scale, sp.color, sp.cell, sp.item);
         else batches.addTube(px, y, pz, yaw, sp.scale, sp.color, sp.cell);
         rowsMax = Math.max(rowsMax, r + 1); placedAny = true;
       }
@@ -555,7 +721,8 @@ function boardGeometry(length, depth, thick) {
  * White laminate wall shelving on a slatwall backing: base cabinet, 4 boards (tops at opts.levels),
  * bevelled front edges, uprights at bay boundaries (~1.2 m), a top rail with black gable mystery
  * boxes every 0.6 m, products on every board. start = world point on the wall line, dir = run
- * direction, out = away from the wall. opts.zone names the instancing zone.
+ * direction, out = away from the wall. opts.zone names the instancing zone; opts.bayZones[i] is the
+ * catalog zone stocked in bay i (bays = round(length / 1.2)).
  */
 export function wallShelves(scene, M, batches, start, dir, length, out, opts = {}) {
   const levels = opts.levels ?? [0.28, 0.72, 1.16, 1.60];
@@ -592,7 +759,7 @@ export function wallShelves(scene, M, batches, start, dir, length, out, opts = {
     for (let i = 0; i < bays; i++) {
       const u0 = i * bayW + 0.018, q = W(u0, 0);
       fillRun(batches, { x: q.x, z: q.z }, dir, bayW - 0.036, out, ly, 'mixed',
-        { depth: 0.38, frontInset: 0.012, backClear: 0.03, maxH: li === 0 ? 0.3 : 0.32, mix: opts.mix?.[li] ?? LEVEL_MIX[li % LEVEL_MIX.length] });
+        { depth: 0.38, frontInset: 0.012, backClear: 0.03, maxH: li === 0 ? 0.3 : 0.32, mix: opts.mix?.[li] ?? LEVEL_MIX[li % LEVEL_MIX.length], catZone: opts.bayZones?.[i] });
     }
   });
   // gable mystery boxes on the rail, one every 0.6 m
@@ -616,7 +783,7 @@ export function wallShelves(scene, M, batches, start, dir, length, out, opts = {
 // ---------------------------------------------------------------------------
 
 /** Centre island 1.0 x 0.85 x lengthZ: kick plinth, spine, end caps, top with a lip, mid and lower shelves. */
-export function gondola(scene, M, batches, x, z, lengthZ = 1.8, zone) {
+export function gondola(scene, M, batches, x, z, lengthZ = 1.8, zone, catZone) {
   const L = lengthZ, g = new THREE.Group(); g.name = 'gondola'; g.position.set(x, 0, z); scene.add(g);
   batches.setZone(zone ?? `gondola${x < 0 ? 'A' : 'B'}`);
   bx(g, 0.84, 0.09, L - 0.08, M.black, 0, 0.045, 0);
@@ -637,7 +804,7 @@ export function gondola(scene, M, batches, x, z, lengthZ = 1.8, zone) {
     for (const s of [-1, 1]) {
       const start = { x: x + s * 0.02, z: z + L / 2 - 0.03 };
       fillRun(batches, start, { x: 0, z: -1 }, L - 0.06, { x: s, z: 0 }, ty, 'mixed',
-        { depth: 0.484, frontInset: li === 2 ? 0.02 : 0.024, backClear: 0.03, maxH: li === 2 ? 0.33 : 0.29, mix: mixes[li], margin: 0.02 });
+        { depth: 0.484, frontInset: li === 2 ? 0.02 : 0.024, backClear: 0.03, maxH: li === 2 ? 0.33 : 0.29, mix: mixes[li], margin: 0.02, catZone });
     }
   });
   contactShadow(g, 0, 0, 1.4, L + 0.4, 'box');
@@ -751,7 +918,7 @@ export function cooler(scene, M, batches, x, z) {
     fillRun(batches, { x: x + 0.3, z: z + 0.93 }, { x: 0, z: -1 }, 1.86, { x: -1, z: 0 }, sy, 'mixed', {
       depth: 0.58, frontInset: 0.018, backClear: 0.02, maxH: 0.31, margin: 0.01, rows: 2,
       mix: li === 0 ? { bottle: 0.75, can: 0.25 } : { bottle: 0.6, can: 0.4 },
-      bottleScale: li === 0 ? [1.05, 1.3] : [0.95, 1.1],
+      bottleScale: li === 0 ? [1.05, 1.3] : [0.95, 1.1], catZone: 'drinks',
     });
   });
   contactShadow(g, 0, 0, 1.15, 2.5, 'box');

@@ -104,9 +104,32 @@ for (const z of [-1.5, -3.7, -5.9, -8.1, -10.3]) for (const x of [-2, 2]) { cons
 const spot = new THREE.PointLight('#fff', 6, 6, 2); spot.position.set(-0.3, 2.4, -9.2); scene.add(spot);
 const cooler = new THREE.PointLight('#dff0ff', 3, 3, 2); cooler.position.set(3.0, 1.8, -9.3); scene.add(cooler);
 
+// ---------------------------------------------------------------- fake catalog (16 x 16 atlas, cell 0 top-left)
+function fakeCatalog() {
+  const N = 16, CS = 128;
+  const plan = [['candy', 20, ['bag', 'box', 'cup', 'bottle', 'can']], ['chips', 12, ['bag']], ['chocolate', 8, ['box', 'bag']], ['cookies', 8, ['box']],
+    ['drinks', 14, ['bottle', 'can']], ['noodles', 8, ['cup']], ['cereal', 4, ['box']], ['pickles', 4, ['bottle']], ['new', 10, ['bag', 'box', 'can', 'cup']]];
+  const items = []; let n = 0;
+  for (const [zone, count, shapes] of plan) for (let i = 0; i < count; i++, n++) items.push({ cell: n, shape: shapes[i % shapes.length], zone, id: 'p' + n, title: `${zone} #${n}` });
+  const c = document.createElement('canvas'); c.width = c.height = N * CS;
+  const x = c.getContext('2d');
+  x.fillStyle = '#333'; x.fillRect(0, 0, c.width, c.height);
+  items.forEach((it) => {
+    const col = it.cell % N, row = Math.floor(it.cell / N), ox = col * CS, oy = row * CS;
+    x.fillStyle = `hsl(${(it.cell * 47) % 360} 70% 55%)`; x.fillRect(ox, oy, CS, CS);
+    x.strokeStyle = '#fff'; x.lineWidth = 6; x.strokeRect(ox + 10, oy + 10, CS - 20, CS - 20);
+    x.fillStyle = '#fff'; x.font = '700 54px Arial'; x.textAlign = 'center'; x.textBaseline = 'middle'; x.fillText(String(it.cell), ox + CS / 2, oy + CS * 0.62);
+    // up arrow
+    x.beginPath(); x.moveTo(ox + CS / 2, oy + 16); x.lineTo(ox + CS / 2 + 18, oy + 44); x.lineTo(ox + CS / 2 + 7, oy + 44); x.lineTo(ox + CS / 2 + 7, oy + 52); x.lineTo(ox + CS / 2 - 7, oy + 52); x.lineTo(ox + CS / 2 - 7, oy + 44); x.lineTo(ox + CS / 2 - 18, oy + 44); x.closePath(); x.fillStyle = '#111'; x.fill();
+    x.fillStyle = '#111'; x.font = '700 14px Arial'; x.fillText(it.zone, ox + CS / 2, oy + CS - 22);
+  });
+  const t = new THREE.CanvasTexture(c); t.colorSpace = THREE.SRGBColorSpace; t.anisotropy = 8;
+  return { texture: t, cells: N, items };
+}
+const useCatalog = new URLSearchParams(location.search).get('catalog') !== '0';
 const tier = { name: 'ultra', shadows: true };
 buildExterior(scene, M);
-const interior = buildInterior(scene, M, tier);
+const interior = buildInterior(scene, M, tier, useCatalog ? { catalog: fakeCatalog() } : {});
 const batches = interior.batches;
 
 const camera = new THREE.PerspectiveCamera(62, innerWidth / innerHeight, 0.05, 80);
@@ -143,6 +166,18 @@ const st = batches.stats();
 window.__stats = { ...st, renderer: null };
 addEventListener('resize', () => { camera.aspect = innerWidth / innerHeight; camera.updateProjectionMatrix(); renderer.setSize(innerWidth, innerHeight); });
 const info = document.getElementById('info');
+// click -> pick() -> highlight
+const raycaster = new THREE.Raycaster(); const ndc = new THREE.Vector2(); let down = null;
+renderer.domElement.addEventListener('pointerdown', (e) => { down = [e.clientX, e.clientY]; });
+renderer.domElement.addEventListener('pointerup', (e) => {
+  if (!down || Math.hypot(e.clientX - down[0], e.clientY - down[1]) > 5) return;
+  ndc.set((e.clientX / innerWidth) * 2 - 1, -(e.clientY / innerHeight) * 2 + 1);
+  raycaster.setFromCamera(ndc, camera);
+  const r = batches.pick(raycaster);
+  console.log('pick', r ? `${r.item.id} ${r.item.title} shape=${r.item.shape} cell=${r.item.cell} d=${r.distance.toFixed(2)} at ${r.point.toArray().map((v) => v.toFixed(2))}` : null);
+  window.__lastPick = r ? { id: r.item.id, title: r.item.title } : null;
+  batches.highlight(r);
+});
 let n = 0;
 renderer.setAnimationLoop(() => {
   renderer.info.reset();

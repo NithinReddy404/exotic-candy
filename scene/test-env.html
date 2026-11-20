@@ -1,0 +1,176 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>scene/env.js + textures.js test</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Fredoka:wght@500;600;700&display=swap" rel="stylesheet">
+<script type="importmap">
+{ "imports": { "three": "https://cdn.jsdelivr.net/npm/three@0.170.0/build/three.module.js", "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.170.0/examples/jsm/" } }
+</script>
+<style>
+  html, body { margin: 0; height: 100%; background: #cfcbc3; overflow: hidden; font: 13px system-ui, sans-serif; }
+  canvas#c { display: block; width: 100vw; height: 100vh; }
+  #ui { position: fixed; left: 8px; top: 8px; display: flex; flex-wrap: wrap; gap: 6px; align-items: center;
+        background: rgba(20, 16, 30, 0.72); color: #fff; padding: 6px 8px; border-radius: 8px; max-width: calc(100vw - 32px); }
+  #ui button { font: inherit; padding: 4px 9px; border: 0; border-radius: 6px; background: #3a3052; color: #fff; cursor: pointer; }
+  #ui button.on { background: #7a3fd3; }
+  #stat { font-variant-numeric: tabular-nums; opacity: 0.9; }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<div id="ui">
+  <span>tier</span>
+  <button data-tier="ultra">ultra</button><button data-tier="high">high</button>
+  <button data-tier="medium">medium</button><button data-tier="low">low</button>
+  <button id="ao">AO</button><button id="inside">inside</button>
+  <span id="stat"></span>
+</div>
+<script>
+  window.EXOTIC_MENU = {
+    store: { name: 'Exotic Candy & Munchies', short: 'Exotic Candy & Munchies', tagline: 'A world of candy. A store worth discovering.' },
+    categories: [{ name: 'Candy' }, { name: 'Chips & Savory Snacks' }, { name: 'Drinks' }, { name: 'New Arrivals' }],
+  };
+</script>
+<script type="module">
+import * as THREE from 'three';
+import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+import { RoundedBoxGeometry } from 'three/addons/geometries/RoundedBoxGeometry.js';
+import { makeTextures, ensureFonts } from './textures.js';
+import { QUALITY, detectTier, createRenderer, setupEnvironment, addLights, materials, createPost } from './env.js';
+
+const tierName = detectTier();
+const tier = { ...QUALITY[tierName] };
+document.querySelectorAll('#ui [data-tier]').forEach((b) => {
+  b.classList.toggle('on', b.dataset.tier === tierName);
+  b.onclick = () => { const u = new URL(location.href); u.searchParams.set('tier', b.dataset.tier); location.href = u; };
+});
+
+const canvas = document.getElementById('c');
+const renderer = createRenderer(canvas, tier);
+const scene = new THREE.Scene();
+const camera = new THREE.PerspectiveCamera(62, innerWidth / innerHeight, 0.05, 80);
+camera.position.set(0.4, 1.6, 5.2);
+setupEnvironment(renderer, scene, tier);
+const lights = addLights(scene, tier);
+
+await ensureFonts();
+let t0 = performance.now();
+const T = makeTextures(7, { maxSize: tier.maxSize });
+const tTex = performance.now() - t0;
+const M = materials(T, tier);
+
+const add = (o, parent = scene) => { parent.add(o); return o; };
+const plane = (w, h, mat, x, y, z, rx = 0, ry = 0) => {
+  const m = new THREE.Mesh(new THREE.PlaneGeometry(w, h), mat);
+  m.position.set(x, y, z); m.rotation.set(rx, ry, 0); m.receiveShadow = true; return add(m);
+};
+const box = (w, h, d, mat, x, y, z, shadow = true) => {
+  const m = new THREE.Mesh(new RoundedBoxGeometry(w, h, d, 3, 0.02), mat);
+  m.position.set(x, y, z); m.castShadow = shadow; m.receiveShadow = true; return add(m);
+};
+
+// Mall: cream tile floor, ceiling at 4.5, far wall, side walls
+plane(14, 12, M.tiled(M.floorTile, 14, 12), 0, 0, 6, -Math.PI / 2);
+plane(14, 12, M.tiled(M.ceiling, 14 / 1.2, 12 / 1.2), 0, 4.5, 6, Math.PI / 2);
+for (const x of [-6, 0, 6]) { const p = plane(0.6, 1.2, M.lightPanel, x, 4.49, 2, Math.PI / 2); p.userData.noAO = true; }
+plane(14, 4.5, M.tiled(M.wallCream, 14, 4.5), 0, 2.25, 12, 0, Math.PI);
+plane(12, 4.5, M.tiled(M.wallCream, 12, 4.5), -7, 2.25, 6, 0, Math.PI / 2);
+plane(12, 4.5, M.tiled(M.wallCream, 12, 4.5), 7, 2.25, 6, 0, -Math.PI / 2);
+// Storefront wall at z=0: pilasters + bulkhead (the opening is x in [-3.2, 3.2])
+for (const sx of [-1, 1]) {
+  box(3.8, 4.5, 0.3, M.tiled(M.wallCream, 3.8, 4.5), sx * 5.1, 2.25, -0.15, false);
+}
+box(6.4, 1.1, 0.3, M.tiled(M.wallCream, 6.4, 1.1), 0, 3.95, -0.15, false);
+// Logo mat
+plane(3.6, 1.2, M.mat, 0, 0.006, 1.0, -Math.PI / 2);
+// Sign hanging in front of the opening
+const sign = plane(4.6, 1.26, M.sign, 0, 3.05, 0.42); sign.userData.noAO = true; sign.castShadow = false;
+for (const x of [-1.2, 1.2]) box(0.03, 1.2, 0.03, M.darkGloss, x, 3.9, 0.4, false);
+
+// Interior shell
+plane(8, 11, M.tiled(M.floorWood, 8, 11), 0, 0.001, -5.5, -Math.PI / 2);
+plane(8, 11, M.tiled(M.ceiling, 8 / 1.2, 11 / 1.2), 0, 3.4, -5.5, Math.PI / 2);
+for (const x of [-2, 2]) for (const z of [-1.5, -3.7, -5.9, -8.1, -10.3]) {
+  const p = plane(0.6, 1.2, M.lightPanel, x, 3.39, z, Math.PI / 2); p.userData.noAO = true;
+}
+const lowerH = 2.3, upperH = 1.1;
+// back wall z=-11 (faces +z)
+plane(8, lowerH, M.tiled(M.tealSlat, 8, lowerH), 0, lowerH / 2, -11);
+plane(8, upperH, M.mural(8 * 180, upperH * 180, 4), 0, lowerH + upperH / 2, -11);
+// left wall x=-4 (faces +x): mural full height up front, slat + mural behind
+plane(4.2, 3.4, M.mural(4.2 * 180, 3.4 * 180, 1), -4, 1.7, -2.1, 0, Math.PI / 2);
+plane(6.8, lowerH, M.tiled(M.tealSlat, 6.8, lowerH), -4, lowerH / 2, -7.6, 0, Math.PI / 2);
+plane(6.8, upperH, M.mural(6.8 * 180, upperH * 180, 3), -4, lowerH + upperH / 2, -7.6, 0, Math.PI / 2);
+// right wall x=4 (faces -x)
+plane(11, lowerH, M.tiled(M.tealSlat, 11, lowerH), 4, lowerH / 2, -5.5, 0, -Math.PI / 2);
+plane(11, upperH, M.mural(11 * 180, upperH * 180, 2), 4, lowerH + upperH / 2, -5.5, 0, -Math.PI / 2);
+
+// Furniture blocks (white laminate)
+box(1.0, 0.85, 1.8, M.white, -1.4, 0.425, -3.2);
+box(1.0, 0.85, 1.8, M.white, 1.4, 0.425, -5.8);
+box(2.4, 1.04, 0.7, M.white, -0.3, 0.52, -10.0);
+box(0.75, 0.85, 1.6, M.white, -3.4, 0.425, -1.6);
+box(0.4, 0.4, 0.4, M.white, -3.7, 0.2, -10.7);
+box(0.3, 0.3, 0.3, M.white, 3.75, 0.15, -10.8);
+// A shelf run with label quads (cells 0..15 from the atlas), against the right wall
+const shelf = box(0.36, 0.03, 3.2, M.white, 3.8, 1.16, -7.5);
+for (let i = 0; i < 16; i++) {
+  const g = new THREE.PlaneGeometry(0.17, 0.22), uv = g.attributes.uv, [ou, ov] = T.labels.cellOffset(i);
+  for (let k = 0; k < uv.count; k++) uv.setXY(k, ou + uv.getX(k) / 4, ov + uv.getY(k) / 4);
+  const q = new THREE.Mesh(g, M.labels); q.position.set(3.62, 1.28, -6.0 - i * 0.2); q.rotation.y = -Math.PI / 2; add(q);
+}
+box(0.34, 0.03, 3.2, M.white, 3.8, 0.72, -7.5);
+// Glass on a box in front of a mural-coloured block (shows transmission / alpha glass)
+box(0.5, 1.0, 0.5, M.product, 2.6, 0.5, -2.2);
+const glass = new THREE.Mesh(new THREE.BoxGeometry(1.0, 1.7, 0.04), M.glass);
+glass.position.set(2.6, 0.9, -1.9); glass.userData.noAO = true; add(glass);
+const jar = new THREE.Mesh(new THREE.CylinderGeometry(0.1, 0.1, 0.26, 24), M.jarGlass); jar.position.set(-1.1, 1.17, -10.0); jar.userData.noAO = true; add(jar);
+
+// Controls
+const controls = new OrbitControls(camera, canvas);
+controls.target.set(0, 1.5, -6);
+controls.enableDamping = true;
+controls.maxPolarAngle = Math.PI * 0.62;
+controls.update();
+
+const post = createPost(renderer, scene, camera, tier);
+function resize() {
+  camera.aspect = innerWidth / innerHeight; camera.updateProjectionMatrix();
+  post.setSize(innerWidth, innerHeight);
+}
+addEventListener('resize', resize); resize();
+
+let aoOn = true, inside = false;
+document.getElementById('ao').onclick = (e) => { aoOn = !aoOn; e.target.classList.toggle('on', aoOn); post.setTier({ ...tier, ao: aoOn && tier.ao }); };
+document.getElementById('ao').classList.toggle('on', tier.ao);
+document.getElementById('inside').onclick = (e) => { inside = !inside; e.target.classList.toggle('on', inside); lights.setInterior(inside); };
+
+let frames = 0, acc = 0, last = performance.now();
+const stat = document.getElementById('stat');
+function frame(now) {
+  const dt = (now - last) / 1000; last = now;
+  controls.update();
+  post.render(dt);
+  frames++; acc += dt;
+  if (acc > 1) { stat.textContent = `${tierName}  ${(frames / acc).toFixed(0)} fps  tex ${tTex.toFixed(0)} ms  pr ${renderer.getPixelRatio()}`; frames = 0; acc = 0; }
+  requestAnimationFrame(frame);
+}
+requestAnimationFrame(frame);
+// Debug helper: render once, then average a region of the canvas (CSS px) -> [r, g, b, 'max', peak] in sRGB 0..255.
+window.__sample = (x, y, w, h) => {
+  post.render(0.016);
+  const c = renderer.domElement, o = document.createElement('canvas'); o.width = c.width; o.height = c.height;
+  const g = o.getContext('2d'); g.drawImage(c, 0, 0);
+  const k = c.width / innerWidth, d = g.getImageData(x * k | 0, y * k | 0, Math.max(1, w * k | 0), Math.max(1, h * k | 0)).data;
+  let r = 0, gg = 0, b = 0, mx = 0; const n = d.length / 4;
+  for (let i = 0; i < d.length; i += 4) { r += d[i]; gg += d[i + 1]; b += d[i + 2]; mx = Math.max(mx, d[i], d[i + 1], d[i + 2]); }
+  return [Math.round(r / n), Math.round(gg / n), Math.round(b / n), 'max', mx];
+};
+window.__t = { THREE, renderer, scene, camera, post, lights, M, T, tier, controls, resize };
+</script>
+</body>
+</html>

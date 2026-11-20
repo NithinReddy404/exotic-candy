@@ -15,6 +15,13 @@ window.EXOTIC_MENU = {
     tagline: "A world of candy. A store worth discovering.",
     greeting: "Hey, welcome in! Here's what we've got — take a look.",
   },
+  // Shopkeeper character. `avatarUrl` can point at any Ready Player Me compatible .glb
+  // (for a photo-exact likeness, make one at https://demo.readyplayer.me/avatar from the
+  // reference photo and paste its .glb link here). Leave null to use the bundled avatar.
+  shopkeeper: {
+    avatarUrl: null,
+    atlasUrl: "assets/keeper_atlas.png",
+  },
   categories: [
     {
       id: "candy",

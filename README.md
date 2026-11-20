@@ -23,8 +23,48 @@ Then open http://localhost:8787/ . Add `?menu` to open the direct (non-3D) menu 
 |------|------------|
 | `index.html` | Page shell, HUD buttons, menu panel, direct-menu fallback |
 | `styles.css` | Styling; the menu is a side panel on desktop and a bottom sheet on phones |
-| `app.js` | The 3D scene (Three.js from a CDN), camera walk, shopkeeper, hotspots, state machine |
-| `menu.js` | **The only source of the menu.** Categories, blurbs, items, prices, photos |
+| `app.js` | Boot, quality tiers, camera walk, HUD, menu, hotspots, state machine |
+| `scene/env.js` | Renderer, lighting, environment, post-processing (ambient occlusion, bloom, SMAA), PBR materials, quality tiers |
+| `scene/textures.js` | Every texture, drawn procedurally with normal and roughness maps (sign, murals, tile, wood, slatwall, labels) |
+| `scene/store.js`, `scene/props.js` | Mall corridor, storefront, shelving, ~2,300 instanced products, gondolas, cooler, freezer, counter |
+| `scene/human.js` | The rigged shopkeeper: clip playback, look-at, body turn, tablet hold and present poses, fallback figure |
+| `assets/` | `keeper.glb` (rigged avatar), `keeper_atlas.png` (repainted skin and clothes), `anim/*.glb` (idle, wave, nod, talking clips) |
+| `menu.js` | **The only source of the menu.** Categories, blurbs, items, prices, photos, shopkeeper avatar URL |
+| `docs/ARCHITECTURE.md` | The module contract the scene was built against |
+
+Test pages: `scene/test-env.html` (materials and lighting per tier), `scene/test-store.html`
+(geometry), `assets/human-test.html` (shopkeeper modes). Force a quality tier with
+`?tier=ultra|high|medium|low`.
+
+## Quality tiers and performance
+
+The tier is picked from the GPU string, device type and memory, then an adaptive governor steps
+down one tier whenever two consecutive 3-second windows average more than 22 ms per frame.
+
+| Tier | Typical device | What it adds |
+|------|----------------|--------------|
+| ultra | NVIDIA / AMD desktop GPU | 2x pixel ratio, 2048 shadow maps, full-res ambient occlusion, bloom, SMAA, glass refraction, 7 area lights |
+| high | Intel Iris/Xe, Apple desktop | 1.5x pixel ratio, half-res ambient occlusion, bloom, SMAA, 7 area lights |
+| medium | phones, Intel UHD | 1.5x pixel ratio, shadows, hemisphere + environment lighting, no post-processing |
+| low | software GL, 2 GB devices | 1x pixel ratio, no shadows, no post-processing |
+
+Measured in the desktop app's browser pane on an Intel UHD iGPU at 810x895: medium 63 fps,
+low 82 fps. A phone-sized viewport on medium ran at 79 fps.
+
+## The shopkeeper
+
+He is a rigged Ready Player Me avatar driven by motion-capture clips from the open RPM animation
+library (idle variations, a left-hand wave, a nod, two talking gestures), with a procedural layer
+on top: eyes lead and the head follows the visitor, eye contact breaks naturally, the body turns
+when you move around him, he glances at the tablet while nobody is near, and he presents the
+tablet toward the camera at the counter. The skin, hair, beard, cream knit polo, light denim and
+white sneakers were painted onto the avatar's texture atlas from the reference photo.
+
+For a photo-exact face, make an avatar from the photo at https://demo.readyplayer.me/avatar
+(guest mode, no account), copy its `.glb` link and paste it into `shopkeeper.avatarUrl` in
+`menu.js`. The loader accepts any RPM-compatible avatar. The base avatar has no facial morph
+targets, so he does not blink or move his mouth; an RPM avatar exported with
+`?morphTargets=ARKit,Oculus Visemes` will, automatically.
 
 ## Adding products and prices
 
@@ -55,14 +95,13 @@ Put photos in a `photos/` folder next to `index.html`. `price` and `note` are op
 
 ## Temporary approximations (replace when you have the asset)
 
-Search `app.js` for these tags.
 
 | Tag | What is approximate | What replaces it |
 |-----|---------------------|------------------|
-| `APPROX-SIGN` | Sign letters are drawn on a canvas in the Fredoka font | The real logo file (PNG/SVG with transparency) |
-| `APPROX-MURAL` | Wall art is procedural shapes in the photo palette | Straight-on photos of each mural wall |
-| `APPROX-KEEPER` | Low-poly placeholder shopkeeper | A reference photo or a rigged character model |
-| `APPROX-GOODS` | Shelf products are coloured blocks | Product photos (also used by the menu) |
+| sign | Sign letters are drawn on a canvas in the Fredoka font with a bevel normal map | The real logo file (PNG/SVG with transparency) |
+| murals | Wall art is procedural spray-paint shapes in the photo palette | Straight-on photos of each mural wall |
+| shopkeeper | Rigged avatar repainted to match the photo; the face is the avatar's, not his | An RPM avatar made from the photo (see above) |
+| products | Packages are generic shapes with a 16-design label atlas | Product photos (also used by the menu) |
 
 ## Photos still needed
 

@@ -1,18 +1,20 @@
 // Exotic Candy & Munchies - first-person 3D store (integration layer).
 //
 // Boot order: detect quality tier -> renderer -> environment -> materials -> exterior ->
-// first frame -> interior + shopkeeper in the background -> post-processing.
-// The state machine, camera walk, HUD, menu and hotspots live here; the rendering stack is
-// scene/env.js + scene/textures.js, the store geometry is scene/store.js + scene/props.js and
-// the rigged shopkeeper is scene/human.js. See docs/ARCHITECTURE.md.
+// first frame -> catalog + photo atlas + interior + shopkeeper in the background -> post stack.
+// The state machine, camera walk, HUD, menu, product cards and hotspots live here; the
+// rendering stack is scene/env.js + scene/textures.js, the store geometry is scene/store.js +
+// scene/props.js, the catalog is scene/catalog.js and the shopkeeper is scene/human.js.
 //
-// No menu, price or inventory is invented: everything comes from menu.js.
+// Every product, price, photo and origin comes from data/products.json, a snapshot of the
+// store's own site; prices on product cards are re-fetched live when a card opens.
 
 import * as THREE from 'three';
 import { detectTier, QUALITY, createRenderer, setupEnvironment, addLights, materials, createPost } from './scene/env.js';
 import { makeTextures, ensureFonts } from './scene/textures.js';
 import { buildExterior, buildInterior } from './scene/store.js';
 import { loadShopkeeper } from './scene/human.js';
+import { loadCatalog, selectFeatured, buildAtlas, livePrice, imageUrl, productUrl, flagFor, categoryLabel } from './scene/catalog.js';
 
 const DATA = window.EXOTIC_MENU;
 const STORE = DATA.store;
@@ -20,6 +22,7 @@ const $ = (s) => document.querySelector(s);
 
 const reduceMotion = matchMedia('(prefers-reduced-motion: reduce)').matches;
 const isNarrow = () => innerWidth < 900;
+const isCoarse = matchMedia('(pointer: coarse)').matches;
 const lerp = (a, b, t) => a + (b - a) * t;
 const clamp = (v, a, b) => Math.max(a, Math.min(b, v));
 const smooth = (t) => t * t * (3 - 2 * t);
@@ -29,17 +32,17 @@ const easeInOut = (t) => 0.5 - 0.5 * Math.cos(Math.PI * t);
 // Scene
 // ---------------------------------------------------------------------------
 const canvasEl = $('#c');
-let renderer, scene, camera, post, M, lights, keeper = null;
+let renderer, scene, camera, post, M, lights, keeper = null, batches = null, catalog = null, atlas = null, atlasLoading = false;
 let tierName = 'high';
 const TIER_ORDER = ['ultra', 'high', 'medium', 'low'];
 const W = () => innerWidth, H = () => innerHeight;
-
 const tierObj = (name) => ({ name, ...QUALITY[name] });
-// 50 deg vertical in landscape; in portrait keep a ~65 deg horizontal field so the storefront fits.
+
+// 50 deg vertical in landscape; in portrait keep a ~62 deg horizontal field so the storefront fits.
 function applyFov() {
   const aspect = W() / H();
   camera.aspect = aspect;
-  camera.fov = aspect >= 1 ? 50 : THREE.MathUtils.radToDeg(2 * Math.atan(Math.tan(THREE.MathUtils.degToRad(65) / 2) / aspect));
+  camera.fov = aspect >= 1 ? 50 : THREE.MathUtils.radToDeg(2 * Math.atan(Math.tan(THREE.MathUtils.degToRad(62) / 2) / aspect));
   camera.updateProjectionMatrix();
 }
 function makeScene() {
@@ -51,16 +54,26 @@ function makeScene() {
   scene = new THREE.Scene();
   camera = new THREE.PerspectiveCamera(50, W() / H(), 0.1, 60);
   applyFov();
-  setupEnvironment(renderer, scene, tier);
+  const envReady = setupEnvironment(renderer, scene, tier);
   const T = makeTextures(7, { maxSize: tier.maxSize });
   M = materials(T, tier);
   lights = addLights(scene, tier);
   buildExterior(scene, M);
+  return envReady;
 }
 
 async function buildRest() {
   const tier = tierObj(tierName);
-  buildInterior(scene, M, tier);
+  // catalog first: the shelves are built from it
+  try {
+    catalog = await loadCatalog('data/products.json');
+    const cells = 16;
+    const items = selectFeatured(catalog, cells);
+    atlas = buildAtlas(items, catalog, { size: (tierName === 'ultra' || tierName === 'high') ? 4096 : 2048, cells, onProgress: (d, n) => setLoadNote(d < n ? `Stocking shelves ${Math.round(d / n * 100)}%` : '') });
+    atlasLoading = true; atlas.ready.then(() => { atlasLoading = false; });
+  } catch (e) { console.warn('catalog unavailable, shelves use generated packaging', e); }
+  const built = buildInterior(scene, M, tier, atlas ? { catalog: atlas } : {});
+  batches = built?.batches || null;
   const sk = DATA.shopkeeper || {};
   try {
     keeper = await loadShopkeeper({
@@ -72,25 +85,20 @@ async function buildRest() {
       animBase: 'assets/anim/',
       tabletMaterial: M.tablet,
     });
-  } catch (e) {
-    console.warn('shopkeeper failed to load', e);
-  }
+  } catch (e) { console.warn('shopkeeper failed to load', e); }
   lights?.refreshShadows?.();
-  // compile every material once now so the walk does not stutter on first-seen shaders
   try { await renderer.compileAsync(scene, camera); } catch {}
+  buildMenu();
 }
+function makePost() { post = createPost(renderer, scene, camera, tierObj(tierName)); }
 
-function makePost() {
-  post = createPost(renderer, scene, camera, tierObj(tierName));
-}
-
-// Adaptive quality: average frame time over 3 s windows (ignoring the first seconds and any
-// window with a hitch); two slow windows in a row step down one tier. Stepping down only
-// changes pixel ratio and post passes, never shadows or light counts (those would recompile).
+// Adaptive quality: average frame time over 3 s windows (ignoring warm-up and hitches); two slow
+// windows in a row step down one tier. Stepping down only changes pixel ratio and post passes.
 const perf = { acc: 0, n: 0, since: 0, slow: 0, warm: 0, hitch: false, settled: false };
 function governor(dt) {
   if (tierName === 'low' || perf.settled) return;
-  if (perf.warm < 3) { perf.warm += dt; return; }
+  if (!interiorDone || atlasLoading) { perf.warm = 0; return; } // texture uploads during stocking are not representative
+  if (perf.warm < 4) { perf.warm += dt; return; }
   if (dt > 0.1) perf.hitch = true;
   perf.acc += dt; perf.n++; perf.since += dt;
   if (perf.since < 3) return;
@@ -103,7 +111,7 @@ function governor(dt) {
       const next = TIER_ORDER[Math.min(TIER_ORDER.indexOf(tierName) + 1, TIER_ORDER.length - 1)];
       if (next !== tierName) setTier(next);
     }
-  } else perf.settled = true; // fast enough: lock it in
+  } else perf.settled = true;
 }
 function setTier(name) {
   tierName = name;
@@ -117,52 +125,51 @@ function setTier(name) {
 // Camera, states and animation
 // ---------------------------------------------------------------------------
 const KEEPER_HEAD = new THREE.Vector3(-0.3, 1.7, -10.75); // refreshed from the rig's Head bone once loaded
-const OUTSIDE = { pos: new THREE.Vector3(0.4, 1.62, 5.2), look: new THREE.Vector3(0, 2.25, 0) };
+// The visit starts right at the entrance, on the mat, facing the sign.
+const START = { pos: new THREE.Vector3(0.3, 1.62, 4.4), look: new THREE.Vector3(0, 2.0, 0) };
 const COUNTER = { pos: new THREE.Vector3(-0.2, 1.62, -8.3), look: KEEPER_HEAD.clone() };
 const WALK = new THREE.CatmullRomCurve3([
-  [0.4, 1.62, 5.2], [0.25, 1.62, 3.0], [0.05, 1.62, 1.0], [-0.05, 1.62, -1.8], [-0.15, 1.62, -5.0], [-0.2, 1.62, -8.3],
+  [0.3, 1.62, 4.4], [0.15, 1.62, 2.2], [0.0, 1.62, -0.2], [-0.05, 1.62, -2.6], [-0.15, 1.62, -5.2], [-0.2, 1.62, -8.3],
 ].map((p) => new THREE.Vector3(...p)), false, 'centripetal');
-const WALK_SECONDS = 8.5;
+const WALK_SECONDS = 8;
 
 const HOTSPOTS = [
   { id: 'candy', label: 'Candy shelves', cat: 'candy', at: [-3.6, 1.5, -7.2], view: { pos: [-1.8, 1.62, -6.6], look: [-3.9, 1.2, -7.4] } },
-  { id: 'new', label: 'New arrivals', cat: 'new', at: [-1.4, 1.2, -3.2], view: { pos: [0.1, 1.62, -1.9], look: [-1.5, 0.85, -3.3] } },
-  { id: 'snacks', label: 'Snack aisle', cat: 'snacks', at: [1.4, 1.2, -5.8], view: { pos: [-0.2, 1.62, -4.3], look: [1.5, 0.85, -6.0] } },
+  { id: 'new', label: 'New arrivals', cat: 'new', at: [1.4, 1.2, -5.8], view: { pos: [-0.2, 1.62, -4.3], look: [1.5, 0.85, -6.0] } },
+  { id: 'chips', label: 'Chips & cookies', cat: 'chips', at: [3.6, 1.5, -3.5], view: { pos: [1.7, 1.62, -2.6], look: [3.9, 1.2, -3.8] } },
   { id: 'drinks', label: 'Drink cooler', cat: 'drinks', at: [3.3, 1.6, -9.3], view: { pos: [0.6, 1.62, -8.4], look: [3.9, 1.2, -9.3] } },
   { id: 'freezer', label: 'Freezer', cat: null, at: [-3.3, 1.1, -1.6], view: { pos: [-1.6, 1.62, -1.0], look: [-3.7, 0.7, -1.7] } },
 ];
 
-let state = 'outside'; // outside | walking | greeting | menu | explore | hotspot | leaving
-const view = { pos: OUTSIDE.pos.clone(), look: OUTSIDE.look.clone(), yaw: 0, pitch: 0, yawLimit: 0.5, pitchLimit: 0.22, shiftX: 0, shiftY: 0, bob: 0, sway: 0 };
+let state = 'outside'; // outside | walking | greeting | menu | explore | hotspot
+const view = { pos: START.pos.clone(), look: START.look.clone(), yaw: 0, pitch: 0, vyaw: 0, vpitch: 0, yawLimit: 0.5, pitchLimit: 0.22, shiftX: 0, shiftY: 0, bob: 0, sway: 0 };
 let transition = null;
 let walking = null;
 let currentHotspot = null;
 let interiorReady = null, interiorDone = false, wasInside = false;
 let lastFrame = performance.now();
 
-// scratch vectors (no per-frame allocation)
 const _dir = new THREE.Vector3(), _right = new THREE.Vector3(), _q = new THREE.Quaternion(), _up = new THREE.Vector3(0, 1, 0);
-const _lookA = new THREE.Vector3(0, 2.3, 0.4), _lookB = new THREE.Vector3(0.2, 1.45, -6.5), _tmp = new THREE.Vector3(), _tmp2 = new THREE.Vector3();
+const _lookA = new THREE.Vector3(0, 2.1, 0.2), _lookB = new THREE.Vector3(0.2, 1.45, -6.5), _tmp = new THREE.Vector3();
 
 function setLimits(yaw, pitch) { view.yawLimit = yaw; view.pitchLimit = pitch; }
-
 function moveTo(pos, look, dur) {
   return new Promise((resolve) => {
     if (reduceMotion || dur <= 0) { view.pos.copy(pos); view.look.copy(look); view.yaw = view.pitch = 0; resolve(); return; }
     transition = { from: { pos: view.pos.clone(), look: view.look.clone() }, to: { pos: pos.clone(), look: look.clone() }, t0: performance.now(), dur: dur * 1000, resolve };
   });
 }
-function walk(reverse) {
+function walk() {
   return new Promise((resolve) => {
-    if (reduceMotion) { const end = reverse ? OUTSIDE : COUNTER; view.pos.copy(end.pos); view.look.copy(end.look); resolve(); return; }
-    walking = { t0: performance.now(), dur: WALK_SECONDS * 1000, reverse, resolve };
+    if (reduceMotion) { view.pos.copy(COUNTER.pos); view.look.copy(COUNTER.look); resolve(); return; }
+    walking = { t0: performance.now(), dur: WALK_SECONDS * 1000, resolve };
   });
 }
 function walkLook(t, out) {
   if (keeper) keeper.headPosition(KEEPER_HEAD);
-  if (t < 0.18) return out.copy(_lookA);
-  if (t < 0.45) return out.copy(_lookA).lerp(_lookB, smooth((t - 0.18) / 0.27));
-  if (t < 0.8) return out.copy(_lookB).lerp(KEEPER_HEAD, smooth((t - 0.45) / 0.35));
+  if (t < 0.15) return out.copy(_lookA);
+  if (t < 0.42) return out.copy(_lookA).lerp(_lookB, smooth((t - 0.15) / 0.27));
+  if (t < 0.8) return out.copy(_lookB).lerp(KEEPER_HEAD, smooth((t - 0.42) / 0.38));
   return out.copy(KEEPER_HEAD);
 }
 
@@ -170,31 +177,32 @@ function updateCamera(now, dt) {
   if (walking) {
     const u = clamp((now - walking.t0) / walking.dur, 0, 1);
     const e = easeInOut(u);
-    const t = walking.reverse ? 1 - e : e;
-    WALK.getPointAt(t, view.pos);
-    if (walking.reverse) {
-      WALK.getPointAt(clamp(t - 0.08, 0, 1), _tmp); _tmp.y = 1.55;
-      _tmp2.set(0.4, 1.5, 12);
-      view.look.copy(_tmp).lerp(_tmp2, smooth(clamp((e - 0.7) / 0.3, 0, 1)));
-    } else walkLook(t, view.look);
-    // gait: ~1.9 steps per second, vertical bob plus a little lateral sway and roll
+    WALK.getPointAt(e, view.pos);
+    walkLook(e, view.look);
     const steps = e * WALK_SECONDS * 1.9;
     const env = Math.sin(Math.PI * u);
     view.bob = Math.sin(steps * Math.PI * 2) * 0.006 * env;
     view.sway = Math.sin(steps * Math.PI) * 0.006 * env;
-    view.yaw *= 0.9; view.pitch *= 0.9;
+    view.yaw *= 0.9; view.pitch *= 0.9; view.vyaw = view.vpitch = 0;
     if (u >= 1) { const r = walking.resolve; walking = null; view.bob = 0; view.sway = 0; r(); }
   } else if (transition) {
     const u = clamp((now - transition.t0) / transition.dur, 0, 1), e = easeInOut(u);
     view.pos.lerpVectors(transition.from.pos, transition.to.pos, e);
     view.look.lerpVectors(transition.from.look, transition.to.look, e);
-    view.yaw *= 0.9; view.pitch *= 0.9;
+    view.yaw *= 0.9; view.pitch *= 0.9; view.vyaw = view.vpitch = 0;
     if (u >= 1) { const r = transition.resolve; transition = null; r(); }
   } else {
-    if (keys.has('ArrowLeft')) view.yaw = clamp(view.yaw + dt * 1.2, -view.yawLimit, view.yawLimit);
-    if (keys.has('ArrowRight')) view.yaw = clamp(view.yaw - dt * 1.2, -view.yawLimit, view.yawLimit);
-    if (keys.has('ArrowUp')) view.pitch = clamp(view.pitch + dt * 0.8, -view.pitchLimit, view.pitchLimit);
-    if (keys.has('ArrowDown')) view.pitch = clamp(view.pitch - dt * 0.8, -view.pitchLimit, view.pitchLimit);
+    if (keys.has('ArrowLeft')) view.vyaw = 1.2;
+    if (keys.has('ArrowRight')) view.vyaw = -1.2;
+    if (keys.has('ArrowUp')) view.vpitch = 0.8;
+    if (keys.has('ArrowDown')) view.vpitch = -0.8;
+    if (!drag) {
+      // inertia after a swipe, with soft limits
+      view.yaw = clamp(view.yaw + view.vyaw * dt, -view.yawLimit, view.yawLimit);
+      view.pitch = clamp(view.pitch + view.vpitch * dt, -view.pitchLimit, view.pitchLimit);
+      const damp = Math.pow(0.02, dt);
+      view.vyaw *= damp; view.vpitch *= damp;
+    }
     if ((state === 'greeting' || state === 'menu') && keeper) { keeper.headPosition(KEEPER_HEAD); view.look.lerp(KEEPER_HEAD, 1 - Math.pow(0.02, dt)); }
   }
   const inside = view.pos.z < 0.3;
@@ -208,7 +216,7 @@ function updateCamera(now, dt) {
   _tmp.copy(camera.position).add(_dir);
   camera.lookAt(_tmp);
   camera.rotation.z += view.sway * 0.4;
-  const overlay = $('#menu').classList.contains('overlay');
+  const overlay = el.menu.classList.contains('overlay');
   const wantX = (state === 'menu' && !isNarrow() && !overlay) ? 0.2 : 0;
   const wantY = (state === 'menu' && isNarrow() && !overlay) ? 0.26 : 0;
   const k = 1 - Math.pow(0.001, dt);
@@ -223,8 +231,9 @@ const keys = new Set();
 const el = {
   hint: $('#hint'), outsideUI: $('#outside-ui'), exploreUI: $('#explore-ui'), hotspots: $('#hotspots'), bubble: $('#bubble'),
   spotCard: $('#spot-card'), spotTitle: $('#spot-title'), spotBody: $('#spot-body'), spotBrowse: $('#spot-browse'),
-  menu: $('#menu'), tabs: $('#tabs'), menuBody: $('#menu-body'), skip: $('#skip'), outside: $('#outside'), voice: $('#voice'),
+  menu: $('#menu'), tabs: $('#tabs'), menuBody: $('#menu-body'), search: $('#search'), skip: $('#skip'), outside: $('#outside'), voice: $('#voice'),
   seeMenu: $('#see-menu'), openMenu: $('#open-menu'), toCounter: $('#to-counter'), loading: $('#loading'), loadingText: $('#loading-text'),
+  tooltip: $('#tooltip'), product: $('#product'), fade: $('#fade'), loadNote: $('#load-note'),
 };
 const v2 = new THREE.Vector3();
 function project(x, y, z) {
@@ -255,38 +264,137 @@ function updateBubble() {
   el.bubble.style.opacity = p.front ? 1 : 0;
 }
 function showHint(text) { el.hint.textContent = text; el.hint.classList.remove('off'); clearTimeout(showHint.t); showHint.t = setTimeout(() => el.hint.classList.add('off'), 3500); }
+function setLoadNote(text) { el.loadNote.textContent = text; el.loadNote.hidden = !text; }
+async function fadeThrough(fn) {
+  if (reduceMotion) { fn(); return; }
+  el.fade.classList.add('on');
+  await new Promise((r) => setTimeout(r, 320));
+  fn();
+  await new Promise((r) => setTimeout(r, 60));
+  el.fade.classList.remove('on');
+}
 
 // ---------------------------------------------------------------------------
-// Menu rendering (shared by the in-store panel and the direct view)
+// Product picking: hover tooltip and click card, with the live price from the store
 // ---------------------------------------------------------------------------
-function renderMenu(tabsEl, bodyEl, activeId) {
-  const cats = DATA.categories;
-  const active = cats.find((c) => c.id === activeId) || cats[0];
-  tabsEl.innerHTML = '';
+const ray = new THREE.Raycaster();
+const ndc = new THREE.Vector2();
+let hovered = null, hoveredKey = '', lastPick = 0;
+function pickAt(cx, cy) {
+  if (!batches?.pick) return null;
+  ndc.set((cx / W()) * 2 - 1, -(cy / H()) * 2 + 1);
+  ray.setFromCamera(ndc, camera);
+  ray.far = 4.5;
+  const hit = batches.pick(ray);
+  return hit && hit.item?.product ? hit : null;
+}
+function canPick() { return (state === 'explore' || state === 'hotspot' || state === 'outside') && !walking && !transition; }
+function hoverAt(cx, cy) {
+  const hit = canPick() ? pickAt(cx, cy) : null;
+  const item = hit?.item || null;
+  const key = hit ? `${hit.mesh?.id}:${hit.instanceId}` : '';
+  if (key !== hoveredKey) { hoveredKey = key; hovered = item; batches?.highlight?.(hit || null); canvasEl.style.cursor = item ? 'pointer' : ''; }
+  if (item) {
+    const p = item.product;
+    el.tooltip.innerHTML = `<b>${esc(p.title)}</b><span>$${esc(p.price)}${p.origin ? ' · ' + flagFor(p.origin) + ' ' + esc(p.origin) : ''}</span>`;
+    el.tooltip.hidden = false;
+    el.tooltip.style.left = clamp(cx + 14, 8, W() - 240) + 'px';
+    el.tooltip.style.top = clamp(cy - 10, 8, H() - 60) + 'px';
+  } else el.tooltip.hidden = true;
+}
+function esc(s) { return String(s ?? '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c])); }
+
+let cardToken = 0;
+function openProduct(p) {
+  if (!p) return;
+  const token = ++cardToken;
+  const img = imageUrl(catalog, p, 600);
+  const origin = p.origin ? `${flagFor(p.origin)} From ${esc(p.origin)}` : 'Origin not listed';
+  const cats = (p.cats || []).filter((c) => c !== 'new' && c !== 'mystery').map(categoryLabel).join(' · ');
+  el.product.innerHTML = `
+    <button class="ghost close" id="product-close" aria-label="Close">Close</button>
+    <div class="p-img">${img ? `<img src="${esc(img)}" alt="${esc(p.title)}">` : '<div class="ph"></div>'}</div>
+    <div class="p-body">
+      <div class="p-cat">${esc(cats || p.type || '')}${p.cats?.includes('new') ? ' <span class="tag">New</span>' : ''}</div>
+      <h2 class="p-title">${esc(p.title)}</h2>
+      <div class="p-price"><span id="p-price">$${esc(p.price)}</span>${p.compare ? ` <s>$${esc(p.compare)}</s>` : ''} <span class="live" id="p-live">checking live price…</span></div>
+      <div class="p-origin">${origin}${p.grams ? ` · ${p.grams} g` : ''}</div>
+      ${p.desc ? `<p class="p-desc">${esc(p.desc)}${p.desc.length >= 160 ? '…' : ''}</p>` : ''}
+      <div class="p-actions">
+        <a class="primary small" href="${esc(productUrl(catalog, p))}" target="_blank" rel="noopener">Buy on exoticsnackguys.com</a>
+        <span class="avail ${p.available ? 'in' : 'out'}" id="p-avail">${p.available ? 'In stock' : 'Sold out'}</span>
+      </div>
+    </div>`;
+  el.product.hidden = false;
+  requestAnimationFrame(() => el.product.classList.add('open'));
+  $('#product-close').addEventListener('click', closeProduct);
+  el.tooltip.hidden = true;
+  livePrice(catalog, p).then((live) => {
+    if (token !== cardToken) return;
+    const lv = $('#p-live');
+    if (!lv) return;
+    if (!live) { lv.textContent = 'price as of last sync'; return; }
+    $('#p-price').textContent = '$' + live.price;
+    lv.textContent = 'live price'; lv.classList.add('ok');
+    const av = $('#p-avail'); av.textContent = live.available ? 'In stock' : 'Sold out'; av.className = 'avail ' + (live.available ? 'in' : 'out');
+  });
+}
+function closeProduct() { el.product.classList.remove('open'); setTimeout(() => { el.product.hidden = true; }, 250); }
+
+// ---------------------------------------------------------------------------
+// Menu: the real catalog, by category, with search
+// ---------------------------------------------------------------------------
+let menuCat = null, menuQuery = '';
+function buildMenu() {
+  if (!catalog) { renderMenuFallback(); return; }
+  el.search.hidden = false;
+  el.search.oninput = () => { menuQuery = el.search.value.trim().toLowerCase(); renderMenuBody(); };
+  renderTabs();
+  renderMenuBody();
+}
+function renderTabs() {
+  el.tabs.innerHTML = '';
+  const cats = catalog.categories.filter((c) => c.key !== 'mystery');
+  if (!menuCat || !cats.some((c) => c.key === menuCat)) menuCat = cats[0]?.key || null;
   for (const c of cats) {
-    const b = document.createElement('button'); b.className = 'tab'; b.setAttribute('role', 'tab'); b.setAttribute('aria-selected', String(c === active)); b.textContent = c.name;
-    b.addEventListener('click', () => renderMenu(tabsEl, bodyEl, c.id));
-    tabsEl.appendChild(b);
+    const b = document.createElement('button'); b.className = 'tab'; b.setAttribute('role', 'tab'); b.setAttribute('aria-selected', String(c.key === menuCat));
+    b.innerHTML = `${esc(c.label)} <small>${c.count}</small>`;
+    b.addEventListener('click', () => { menuCat = c.key; renderTabs(); renderMenuBody(); });
+    el.tabs.appendChild(b);
   }
-  bodyEl.innerHTML = '';
-  const blurb = document.createElement('p'); blurb.className = 'cat-blurb'; blurb.textContent = active.blurb; bodyEl.appendChild(blurb);
-  if (!active.items.length) {
-    const e = document.createElement('div'); e.className = 'empty';
-    e.innerHTML = `Products and prices for <b>${active.name}</b> are being added.<small>Ask at the counter for today's selection.</small>`;
-    bodyEl.appendChild(e); return;
-  }
+}
+function renderMenuBody() {
+  const body = el.menuBody; body.innerHTML = '';
+  let list;
+  if (menuQuery) list = catalog.products.filter((p) => p.title.toLowerCase().includes(menuQuery) || (p.origin || '').toLowerCase().includes(menuQuery));
+  else list = catalog.products.filter((p) => p.cats.includes(menuCat));
+  const head = document.createElement('p'); head.className = 'cat-blurb';
+  head.textContent = menuQuery ? `${list.length} result${list.length === 1 ? '' : 's'} for "${menuQuery}"` : `${list.length} products · tap one for the live price and where it is from`;
+  body.appendChild(head);
+  if (!list.length) { const e = document.createElement('div'); e.className = 'empty'; e.textContent = 'Nothing matches.'; body.appendChild(e); return; }
   const grid = document.createElement('div'); grid.className = 'grid';
-  for (const it of active.items) {
-    const card = document.createElement('div'); card.className = 'item';
-    if (it.photo) { const img = document.createElement('img'); img.src = it.photo; img.alt = it.name; img.loading = 'lazy'; card.appendChild(img); }
-    else { const ph = document.createElement('div'); ph.className = 'ph'; card.appendChild(ph); }
-    const meta = document.createElement('div'); meta.className = 'meta';
-    const n = document.createElement('div'); n.className = 'name'; n.textContent = it.name; meta.appendChild(n);
-    if (it.price) { const p = document.createElement('div'); p.className = 'price'; p.textContent = it.price; meta.appendChild(p); }
-    if (it.note) { const p = document.createElement('div'); p.className = 'note'; p.textContent = it.note; meta.appendChild(p); }
-    card.appendChild(meta); grid.appendChild(card);
+  const frag = document.createDocumentFragment();
+  for (const p of list) {
+    const card = document.createElement('button'); card.className = 'item'; card.type = 'button';
+    const img = imageUrl(catalog, p, 200);
+    card.innerHTML = `${img ? `<img src="${esc(img)}" alt="" loading="lazy">` : '<div class="ph"></div>'}
+      <div class="meta"><div class="name">${esc(p.title)}</div><div class="price">$${esc(p.price)}${p.compare ? ` <s>$${esc(p.compare)}</s>` : ''}</div>
+      <div class="note">${p.origin ? flagFor(p.origin) + ' ' + esc(p.origin) : ''}${p.available ? '' : ' · sold out'}</div></div>`;
+    card.addEventListener('click', () => openProduct(p));
+    frag.appendChild(card);
   }
-  bodyEl.appendChild(grid);
+  grid.appendChild(frag); body.appendChild(grid);
+}
+function renderMenuFallback() {
+  // catalog missing: show the static categories from menu.js
+  const cats = DATA.categories; const active = cats.find((c) => c.id === menuCat) || cats[0];
+  el.tabs.innerHTML = '';
+  for (const c of cats) { const b = document.createElement('button'); b.className = 'tab'; b.setAttribute('aria-selected', String(c === active)); b.textContent = c.name; b.addEventListener('click', () => { menuCat = c.id; renderMenuFallback(); }); el.tabs.appendChild(b); }
+  el.menuBody.innerHTML = `<p class="cat-blurb">${esc(active.blurb)}</p><div class="empty">The product list could not be loaded.<small>Run scripts/sync_products.py to refresh data/products.json.</small></div>`;
+}
+function openMenuAt(cat) {
+  if (cat && catalog?.categories.some((c) => c.key === cat)) { menuCat = cat; menuQuery = ''; el.search.value = ''; renderTabs(); renderMenuBody(); }
+  else if (!catalog) { menuCat = cat; renderMenuFallback(); }
 }
 
 // ---------------------------------------------------------------------------
@@ -301,13 +409,13 @@ function setState(s) {
   el.outside.hidden = !(s === 'explore' || s === 'hotspot' || s === 'menu' && stateBeforeMenu !== 'outside');
   el.skip.hidden = !(s === 'outside' || s === 'walking');
   if (s !== 'hotspot') el.spotCard.hidden = true;
-  if (s === 'outside') setLimits(0.5, 0.22);
+  if (s === 'outside') setLimits(0.55, 0.25);
   if (s === 'explore') setLimits(1.3, 0.45);
-  if (s === 'hotspot') setLimits(0.6, 0.35);
+  if (s === 'hotspot') setLimits(0.7, 0.4);
   if (s === 'menu') setLimits(0.25, 0.15);
   if (s === 'greeting') setLimits(0.2, 0.12);
+  if (s !== 'explore' && s !== 'hotspot') { el.tooltip.hidden = true; if (hovered) { hovered = null; hoveredKey = ''; batches?.highlight?.(null); } }
 }
-
 async function enterStore() {
   if (state !== 'outside') return;
   setState('walking');
@@ -315,7 +423,8 @@ async function enterStore() {
   if (!interiorDone) { el.seeMenu.textContent = 'Preparing…'; el.seeMenu.disabled = true; }
   await interiorReady;
   el.seeMenu.textContent = 'See menu'; el.seeMenu.disabled = false;
-  await walk(false);
+  if (state !== 'walking') return;
+  await walk();
   greet();
 }
 function greet() {
@@ -328,11 +437,10 @@ function greet() {
 }
 function openMenu({ from = state, cat = null, overlay = false } = {}) {
   stateBeforeMenu = from === 'menu' ? stateBeforeMenu : from;
-  renderMenu(el.tabs, el.menuBody, cat);
+  openMenuAt(cat);
   el.menu.hidden = false; el.menu.classList.toggle('overlay', overlay);
   requestAnimationFrame(() => el.menu.classList.add('open'));
   setState('menu');
-  el.menu.querySelector('.tab')?.focus({ preventScroll: true });
   clearTimeout(openMenu.bubbleT); openMenu.bubbleT = setTimeout(() => { el.bubble.hidden = true; }, 5000);
 }
 function closeMenu() {
@@ -343,16 +451,16 @@ function closeMenu() {
   if (stateBeforeMenu === 'hotspot' && currentHotspot) { setState('hotspot'); el.spotCard.hidden = false; return; }
   keeper?.setMode('idle');
   setState('explore');
-  showHint('Tap a marked spot, or look around');
+  showHint(isCoarse ? 'Tap a product or a marked spot' : 'Point at a product, or tap a marked spot');
 }
 async function goHotspot(h) {
   if (state !== 'explore') return;
   currentHotspot = h; setState('hotspot');
   await moveTo(new THREE.Vector3(...h.view.pos), new THREE.Vector3(...h.view.look), 1.7);
-  const cat = DATA.categories.find((c) => c.id === h.cat);
+  const c = catalog?.categories.find((x) => x.key === h.cat);
   el.spotTitle.textContent = h.label;
-  el.spotBody.textContent = cat ? cat.blurb : 'Chilled treats by the entrance.';
-  el.spotBrowse.hidden = !cat; if (cat) el.spotBrowse.textContent = `Browse ${cat.name}`;
+  el.spotBody.textContent = c ? `${c.count} ${c.label.toLowerCase()} products. Tap any package for its price and where it is from.` : 'Chilled treats by the entrance.';
+  el.spotBrowse.hidden = !h.cat; if (h.cat) el.spotBrowse.textContent = `Browse ${c ? c.label : h.label}`;
   el.spotBrowse.onclick = () => openMenu({ from: 'hotspot', cat: h.cat });
   el.spotCard.hidden = false;
 }
@@ -361,15 +469,13 @@ async function backToCounter() {
   el.spotCard.hidden = true; currentHotspot = null; setState('explore');
   await moveTo(COUNTER.pos, COUNTER.look, 1.6);
 }
-async function backOutside() {
+// "Start over": straight back to the entrance where we came from, no walk-out.
+async function startOver() {
   if (state === 'menu') { el.menu.classList.remove('open'); el.menu.hidden = true; }
-  el.bubble.hidden = true; el.spotCard.hidden = true; currentHotspot = null;
-  setState('leaving');
+  el.bubble.hidden = true; el.spotCard.hidden = true; currentHotspot = null; closeProduct();
   keeper?.setMode('idle');
-  if (view.pos.distanceTo(COUNTER.pos) > 0.3) await moveTo(COUNTER.pos, new THREE.Vector3(0, 1.5, 2), 1.4);
-  await walk(true);
-  await moveTo(OUTSIDE.pos, OUTSIDE.look, 1.2);
-  setState('outside'); showHint('Drag or swipe to look around');
+  await fadeThrough(() => { walking = null; transition = null; view.pos.copy(START.pos); view.look.copy(START.look); view.yaw = view.pitch = view.vyaw = view.vpitch = 0; setState('outside'); });
+  showHint('Drag or swipe to look around');
 }
 function skipTour() {
   if (state === 'walking') { walking = null; view.bob = 0; view.sway = 0; view.pos.copy(COUNTER.pos); view.look.copy(COUNTER.look); keeper?.setMode('present'); openMenu({ from: 'walking', overlay: true }); return; }
@@ -380,19 +486,40 @@ function skipTour() {
 // Input
 // ---------------------------------------------------------------------------
 let drag = null;
-canvasEl.addEventListener('pointerdown', (e) => { if (walking || transition) return; drag = { x: e.clientX, y: e.clientY, yaw: view.yaw, pitch: view.pitch }; canvasEl.setPointerCapture(e.pointerId); canvasEl.focus({ preventScroll: true }); });
-canvasEl.addEventListener('pointermove', (e) => {
-  if (!drag) return;
-  const s = 2.2 / Math.max(W(), 400);
-  view.yaw = clamp(drag.yaw + (e.clientX - drag.x) * s, -view.yawLimit, view.yawLimit);
-  view.pitch = clamp(drag.pitch + (e.clientY - drag.y) * s * 0.8, -view.pitchLimit, view.pitchLimit);
+canvasEl.addEventListener('pointerdown', (e) => {
+  if (walking || transition) return;
+  drag = { x: e.clientX, y: e.clientY, yaw: view.yaw, pitch: view.pitch, t: performance.now(), moved: false, lt: performance.now() };
+  view.vyaw = view.vpitch = 0;
+  canvasEl.setPointerCapture(e.pointerId); canvasEl.focus({ preventScroll: true });
 });
-const endDrag = () => { drag = null; };
-canvasEl.addEventListener('pointerup', endDrag); canvasEl.addEventListener('pointercancel', endDrag);
+canvasEl.addEventListener('pointermove', (e) => {
+  if (drag) {
+    const s = 2.2 / Math.max(W(), 400);
+    if (Math.hypot(e.clientX - drag.x, e.clientY - drag.y) > 6) drag.moved = true;
+    const nyaw = clamp(drag.yaw + (e.clientX - drag.x) * s, -view.yawLimit, view.yawLimit);
+    const npitch = clamp(drag.pitch + (e.clientY - drag.y) * s * 0.8, -view.pitchLimit, view.pitchLimit);
+    const now = performance.now(), dt = Math.max(0.008, (now - drag.lt) / 1000);
+    view.vyaw = (nyaw - view.yaw) / dt; view.vpitch = (npitch - view.pitch) / dt;
+    view.yaw = nyaw; view.pitch = npitch; drag.lt = now;
+    el.tooltip.hidden = true;
+    return;
+  }
+  if (!isCoarse && performance.now() - lastPick > 50) { lastPick = performance.now(); hoverAt(e.clientX, e.clientY); }
+});
+const endDrag = (e) => {
+  if (!drag) return;
+  const tap = !drag.moved && performance.now() - drag.t < 400;
+  const stale = performance.now() - drag.lt > 80;
+  if (stale) view.vyaw = view.vpitch = 0; else { view.vyaw = clamp(view.vyaw, -3, 3) * 0.5; view.vpitch = clamp(view.vpitch, -3, 3) * 0.5; }
+  drag = null;
+  if (tap && canPick()) { const hit = pickAt(e.clientX, e.clientY); if (hit) openProduct(hit.item.product); else if (!el.product.hidden) closeProduct(); }
+};
+canvasEl.addEventListener('pointerup', endDrag); canvasEl.addEventListener('pointercancel', () => { drag = null; });
+canvasEl.addEventListener('pointerleave', () => { if (!drag) hoverAt(-1, -1); });
 addEventListener('keydown', (e) => {
-  if (e.target.closest('input, textarea')) return;
+  if (e.target.closest('input, textarea')) { if (e.key === 'Escape') e.target.blur(); return; }
   if (['ArrowLeft', 'ArrowRight', 'ArrowUp', 'ArrowDown'].includes(e.key) && state !== 'menu') { keys.add(e.key); e.preventDefault(); }
-  if (e.key === 'Escape') { if (state === 'menu') closeMenu(); else if (state === 'hotspot') backToCounter(); }
+  if (e.key === 'Escape') { if (!el.product.hidden) closeProduct(); else if (state === 'menu') closeMenu(); else if (state === 'hotspot') backToCounter(); }
   if ((e.key === 'Enter' || e.key === ' ') && state === 'outside' && e.target === canvasEl) { e.preventDefault(); enterStore(); }
 });
 addEventListener('keyup', (e) => keys.delete(e.key));
@@ -402,10 +529,11 @@ let voiceOn = false;
 el.voice.addEventListener('click', () => { voiceOn = !voiceOn; el.voice.setAttribute('aria-pressed', String(voiceOn)); el.voice.textContent = voiceOn ? 'Voice on' : 'Voice off'; if (!voiceOn && 'speechSynthesis' in window) speechSynthesis.cancel(); });
 el.seeMenu.addEventListener('click', enterStore);
 el.skip.addEventListener('click', skipTour);
-el.outside.addEventListener('click', backOutside);
+el.outside.addEventListener('click', startOver);
 $('#menu-close').addEventListener('click', closeMenu);
 el.openMenu.addEventListener('click', () => { keeper?.setMode('present'); openMenu({ from: state, cat: currentHotspot?.cat || null }); });
 el.toCounter.addEventListener('click', backToCounter);
+el.product.addEventListener('click', (e) => { if (e.target === el.product) closeProduct(); });
 
 addEventListener('resize', () => {
   if (!renderer) return;
@@ -417,12 +545,15 @@ addEventListener('resize', () => {
 // Direct (2D) menu view
 // ---------------------------------------------------------------------------
 function webglOK() { try { const c = document.createElement('canvas'); return !!(c.getContext('webgl2') || c.getContext('webgl')); } catch { return false; } }
-function showFallback({ allow3D }) {
+async function showFallback({ allow3D }) {
   $('#app').hidden = true; const fb = $('#fallback'); fb.hidden = false;
   $('#fb-tagline').textContent = STORE.tagline;
-  renderMenu($('#fb-tabs'), $('#fb-body'));
+  try { catalog = catalog || await loadCatalog('data/products.json'); } catch {}
+  // reuse the in-store menu renderer against the fallback containers
+  el.tabs = $('#fb-tabs'); el.menuBody = $('#fb-body'); el.search = $('#fb-search');
+  buildMenu();
   const enter = $('#fb-enter'); enter.hidden = !allow3D;
-  enter.addEventListener('click', () => { fb.hidden = true; $('#app').hidden = false; start3D(); });
+  enter.addEventListener('click', () => { fb.hidden = true; $('#app').hidden = false; el.tabs = $('#tabs'); el.menuBody = $('#menu-body'); el.search = $('#search'); start3D(); });
 }
 
 // ---------------------------------------------------------------------------
@@ -437,7 +568,7 @@ async function start3D() {
   updateCamera(performance.now(), 0.016);
   renderer.render(scene, camera);
   el.loading.classList.add('off');
-  interiorReady = new Promise((resolve) => setTimeout(async () => { try { await buildRest(); } finally { makePost(); interiorDone = true; resolve(); } }, 40));
+  interiorReady = new Promise((resolve) => setTimeout(async () => { try { await buildRest(); } finally { makePost(); interiorDone = true; setLoadNote(''); resolve(); } }, 40));
   canvasEl.addEventListener('webglcontextlost', (e) => { e.preventDefault(); renderer.setAnimationLoop(null); showFallback({ allow3D: false }); });
   showHint('Drag or swipe to look around');
   lastFrame = performance.now();
@@ -452,7 +583,7 @@ function frame(now) {
   governor(dt);
 }
 
-window.__exotic = { get state() { return state; }, view, get tier() { return tierName; }, walking: () => !!walking, get keeper() { return keeper; }, get renderer() { return renderer; }, get scene() { return scene; }, setTier };
+window.__exotic = { get state() { return state; }, view, get tier() { return tierName; }, walking: () => !!walking, get keeper() { return keeper; }, get renderer() { return renderer; }, get scene() { return scene; }, get catalog() { return catalog; }, get batches() { return batches; }, setTier, openProduct };
 const forceMenu = new URLSearchParams(location.search).has('menu'); // ?menu opens the direct menu view
 if (!webglOK()) showFallback({ allow3D: false });
 else if (reduceMotion || forceMenu) showFallback({ allow3D: true });

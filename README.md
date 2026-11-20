@@ -29,7 +29,9 @@ Then open http://localhost:8787/ . Add `?menu` to open the direct (non-3D) menu 
 | `scene/store.js`, `scene/props.js` | Mall corridor, storefront, shelving, ~2,300 instanced products, gondolas, cooler, freezer, counter |
 | `scene/human.js` | The rigged shopkeeper: clip playback, look-at, body turn, tablet hold and present poses, fallback figure |
 | `assets/` | `keeper.glb` (rigged avatar), `keeper_atlas.png` (repainted skin and clothes), `anim/*.glb` (idle, wave, nod, talking clips) |
-| `menu.js` | **The only source of the menu.** Categories, blurbs, items, prices, photos, shopkeeper avatar URL |
+| `scene/catalog.js` | Loads `data/products.json`, picks the shelf products, builds the photo atlas, fetches live prices |
+| `data/products.json` | Catalog snapshot from exoticsnackguys.com (`scripts/sync_products.py` refreshes it) |
+| `menu.js` | Store name, greeting, shopkeeper avatar URL, and the fallback categories if the catalog is missing |
 | `docs/ARCHITECTURE.md` | The module contract the scene was built against |
 
 Test pages: `scene/test-env.html` (materials and lighting per tier), `scene/test-store.html`
@@ -43,8 +45,8 @@ down one tier whenever two consecutive 3-second windows average more than 22 ms 
 
 | Tier | Typical device | What it adds |
 |------|----------------|--------------|
-| ultra | NVIDIA / AMD desktop GPU | 2x pixel ratio, 2048 shadow maps, full-res ambient occlusion, bloom, SMAA, glass refraction, 7 area lights |
-| high | Intel Iris/Xe, Apple desktop | 1.5x pixel ratio, half-res ambient occlusion, bloom, SMAA, 7 area lights |
+| ultra | NVIDIA / AMD desktop GPU | 2x pixel ratio, 2048 shadow maps, full-res ambient occlusion, bloom, vignette and grain, SMAA, glass refraction, 9 area lights, real HDRI lighting |
+| high | Intel Iris/Xe, Apple desktop | 1.5x pixel ratio, half-res ambient occlusion, bloom, vignette and grain, SMAA, 9 area lights, real HDRI lighting |
 | medium | phones, Intel UHD | 1.5x pixel ratio, shadows, hemisphere + environment lighting, no post-processing |
 | low | software GL, 2 GB devices | 1x pixel ratio, no shadows, no post-processing |
 
@@ -66,20 +68,45 @@ For a photo-exact face, make an avatar from the photo at https://demo.readyplaye
 targets, so he does not blink or move his mouth; an RPM avatar exported with
 `?morphTargets=ARKit,Oculus Visemes` will, automatically.
 
-## Adding products and prices
+## The products
 
-Nothing in the menu is invented. The four categories and their one-line blurbs come from the
-Candy Guys concept deck (global candy, exotic snacks, specialty drinks, fun finds), shown as
-Candy, Chips & Savory Snacks, Drinks and New Arrivals. Each category's `items` list is empty
-until you add real products:
+Every product on the shelves and in the menu is pulled from the store's own site,
+https://www.exoticsnackguys.com (Shopify): 954 published products across Candy, Chips,
+Chocolate, Cookies, Drinks, Cereal, Ramen & Noodles, Pickles, Sparkling Water, Mystery Box and
+New Arrivals, with the store's photo, price, weight, description and country of origin (from the
+store's own tags; 916 of 954 have one). The snapshot lives in `data/products.json`.
 
-```js
-items: [
-  { name: "Product name", price: "$4.49", photo: "photos/product.jpg", note: "Country" },
-]
+- **On the shelves:** 256 of them stand on the 3D shelves with their real packaging photo, grouped
+  the way the store groups them (candy on the left wall, chips/cookies/chocolate on the right,
+  noodles and cereal at the back, new arrivals on the centre island, drinks in the cooler).
+- **Point or tap:** hovering a package shows its name, price and origin; tapping opens a card
+  with the photo, description, weight, country, a "Buy on exoticsnackguys.com" link, and the
+  **live price and stock** fetched from the store at that moment (the card says "live price"
+  once it has it, or "price as of last sync" if the store cannot be reached).
+- **Menu:** every product, by category, with search across names and countries.
+
+### Refreshing the catalog
+
+```bash
+python scripts/sync_products.py
 ```
 
-Put photos in a `photos/` folder next to `index.html`. `price` and `note` are optional.
+The store rate-limits scripts hard, so the sync goes slowly (about 6 s per request). If it is
+blocked from your network, open https://www.exoticsnackguys.com/collections/chips/products.json
+in a browser, open the developer console and run the snippet below; it prints the JSON to copy
+into `data/products.json`.
+
+```js
+(async () => { const cats = { candy: 'candy-1', chips: 'chips', chocolate: 'snacks', cookies: 'others', drinks: 'drinks', cereal: 'cereals', noodles: 'noodles', pickles: 'pickles', sparkling: 'sparkling-water', mystery: 'mystery-box', new: 'new-products' };
+const strip = (h) => (h || '').replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').trim(); const base = 'https://cdn.shopify.com/s/files/1/0758/3475/3331/files/'; const out = new Map();
+for (const [key, h] of Object.entries(cats)) for (let page = 1; page < 20; page++) { const r = await fetch(`/collections/${h}/products.json?limit=250&page=${page}`); const d = await r.json(); if (!d.products.length) break;
+for (const p of d.products) { const v = p.variants[0] || {}; const img = p.images[0]?.src || null; const rec = out.get(p.id) || { id: p.id, handle: p.handle, title: p.title, price: v.price, compare: v.compare_at_price, available: !!v.available, grams: v.grams, image: img && img.startsWith(base) ? img.slice(base.length) : img, type: p.product_type, cats: [], origin: null, desc: strip(p.body_html).slice(0, 160), tags: p.tags }; if (!rec.cats.includes(key)) rec.cats.push(key); out.set(p.id, rec); }
+await new Promise((r) => setTimeout(r, 1500)); if (d.products.length < 250) break; }
+console.log(JSON.stringify({ source: 'https://www.exoticsnackguys.com', fetched_at: new Date().toISOString(), image_base: base, categories: cats, products: [...out.values()] })); })();
+```
+
+(The console version leaves `origin` null and keeps `tags`; `scripts/sync_products.py` shows
+the tag-to-country mapping if you want to fill it in.)
 
 ## What the 3D scene reproduces from the photos
 
@@ -117,9 +144,9 @@ These angles are missing and are currently approximated:
 ## Controls
 
 - Mouse drag, touch swipe, or arrow keys to look around.
-- **See menu** (or Enter/Space with the 3D view focused) walks in.
+- The visit starts on the mat at the entrance. **See menu** (or Enter/Space with the 3D view focused) walks in.
 - **Skip tour** opens the same menu immediately without walking.
-- **Back outside** walks back to the corridor. **Back to counter** returns from a hotspot.
-- Hotspots: Candy shelves, Snack aisle, Drink cooler, New arrivals, Freezer. Esc closes the menu.
+- **Start over** cuts straight back to the entrance. **Back to counter** returns from a hotspot.
+- Hotspots: Candy shelves, New arrivals, Chips & cookies, Drink cooler, Freezer. Point at or tap any package for its price and origin. Esc closes cards and the menu.
 - **Voice** is off by default; when on, the greeting is spoken with the browser's own voice.
 - Reduced-motion users and devices without WebGL get the direct menu view automatically.

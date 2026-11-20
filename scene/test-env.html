@@ -54,7 +54,9 @@ const renderer = createRenderer(canvas, tier);
 const scene = new THREE.Scene();
 const camera = new THREE.PerspectiveCamera(62, innerWidth / innerHeight, 0.05, 80);
 camera.position.set(0.4, 1.6, 5.2);
-setupEnvironment(renderer, scene, tier);
+// ?env=photo_studio_01 | empty_warehouse_01 | small_empty_house | room  (room = RoomEnvironment only)
+const envParam = new URLSearchParams(location.search).get('env');
+const envReady = setupEnvironment(renderer, scene, tier, envParam ? { hdr: envParam === 'room' ? null : envParam } : {});
 const lights = addLights(scene, tier);
 
 await ensureFonts();
@@ -170,7 +172,7 @@ window.__sample = (x, y, w, h) => {
   for (let i = 0; i < d.length; i += 4) { r += d[i]; gg += d[i + 1]; b += d[i + 2]; mx = Math.max(mx, d[i], d[i + 1], d[i + 2]); }
   return [Math.round(r / n), Math.round(gg / n), Math.round(b / n), 'max', mx];
 };
-window.__t = { THREE, renderer, scene, camera, post, lights, M, T, tier, controls, resize };
+window.__t = { envReady, THREE, renderer, scene, camera, post, lights, M, T, tier, controls, resize };
 </script>
 </body>
 </html>

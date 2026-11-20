@@ -18,6 +18,7 @@
 
 import * as THREE from 'three';
 import { RoomEnvironment } from 'three/addons/environments/RoomEnvironment.js';
+import { RGBELoader } from 'three/addons/loaders/RGBELoader.js';
 import { RectAreaLightUniformsLib } from 'three/addons/lights/RectAreaLightUniformsLib.js';
 import { EffectComposer } from 'three/addons/postprocessing/EffectComposer.js';
 import { RenderPass } from 'three/addons/postprocessing/RenderPass.js';
@@ -25,6 +26,7 @@ import { GTAOPass } from 'three/addons/postprocessing/GTAOPass.js';
 import { UnrealBloomPass } from 'three/addons/postprocessing/UnrealBloomPass.js';
 import { SMAAPass } from 'three/addons/postprocessing/SMAAPass.js';
 import { OutputPass } from 'three/addons/postprocessing/OutputPass.js';
+import { ShaderPass } from 'three/addons/postprocessing/ShaderPass.js';
 
 // ---------------------------------------------------------------------------
 // Quality tiers
@@ -34,25 +36,25 @@ import { OutputPass } from 'three/addons/postprocessing/OutputPass.js';
 export const QUALITY = {
   ultra: {
     name: 'ultra', pixelRatio: 2, shadows: true, shadowMap: 2048, spotShadowMap: 1024,
-    ao: true, aoSamples: 16, aoHalf: false, bloom: true, smaa: true, anisotropy: 8,
-    envIntensity: 0.3, envInterior: 0.22, maxSize: 2048, rectLights: 'full', transmission: true, maxLights: 8,
+    ao: true, aoSamples: 16, aoHalf: false, bloom: true, smaa: true, grade: true, anisotropy: 8,
+    envIntensity: 0.44, envInterior: 0.32, maxSize: 2048, rectLights: 'full', transmission: true, maxLights: 8,
   },
   high: {
     name: 'high', pixelRatio: 1.5, shadows: true, shadowMap: 1024, spotShadowMap: 1024,
-    ao: true, aoSamples: 8, aoHalf: true, bloom: true, smaa: true, anisotropy: 8,
-    envIntensity: 0.3, envInterior: 0.22, maxSize: 2048, rectLights: 'full', transmission: false, maxLights: 8,
+    ao: true, aoSamples: 8, aoHalf: true, bloom: true, smaa: true, grade: true, anisotropy: 8,
+    envIntensity: 0.44, envInterior: 0.32, maxSize: 2048, rectLights: 'full', transmission: false, maxLights: 8,
   },
   medium: {
     name: 'medium', pixelRatio: 1.5, shadows: true, shadowMap: 1024, spotShadowMap: 512,
     ao: false, aoSamples: 0, aoHalf: false, bloom: false, smaa: false, anisotropy: 4,
     // Measured on an Intel UHD iGPU: four rect lights cost ~45% of the frame, so phones get the
     // hemisphere + environment lighting of the low tier and keep shadows and the sharper pixel ratio.
-    envIntensity: 0.7, envInterior: 0.7, maxSize: 1024, rectLights: 'none', transmission: false, maxLights: 6,
+    envIntensity: 0.8, envInterior: 0.8, maxSize: 1024, rectLights: 'none', transmission: false, maxLights: 6,
   },
   low: {
     name: 'low', pixelRatio: 1, shadows: false, shadowMap: 512, spotShadowMap: 512,
     ao: false, aoSamples: 0, aoHalf: false, bloom: false, smaa: false, anisotropy: 2,
-    envIntensity: 0.7, envInterior: 0.7, maxSize: 1024, rectLights: 'none', transmission: false, maxLights: 4,
+    envIntensity: 0.8, envInterior: 0.8, maxSize: 1024, rectLights: 'none', transmission: false, maxLights: 4,
   },
 };
 
@@ -125,19 +127,49 @@ export function createRenderer(canvas, tier) {
 // ---------------------------------------------------------------------------
 // Environment
 // ---------------------------------------------------------------------------
-/** PMREM of RoomEnvironment as image-based light; neutral cream background; no fog. Returns the env texture. */
-export function setupEnvironment(renderer, scene, tier) {
+// The HDRI is used for lighting and reflections only; the visible background stays a flat neutral.
+export const ENV_HDR = 'empty_warehouse_01'; // picked over photo_studio_01: warm neutral fill plus soft window-like reflections on the tile
+// Brightness of RoomEnvironment relative to the HDRI at the same intensity, so the synchronous first frame
+// matches the final look (tier envIntensity values are tuned for the HDRI).
+const ROOM_FACTOR = 0.75;
+let envScale = ROOM_FACTOR, envRefresh = null;
+
+/**
+ * Image-based light. Applies RoomEnvironment synchronously (the first frame is never dark), then swaps in the
+ * HDRI (assets/env/<ENV_HDR>.hdr via RGBELoader + PMREM).
+ * @param {object} [opts]  { hdr: name without extension, or null to stay on RoomEnvironment }
+ * @returns {Promise<THREE.Texture>} resolves with the final environment texture once the HDRI is applied
+ *          (resolves with the RoomEnvironment texture if the file cannot be loaded).
+ */
+export function setupEnvironment(renderer, scene, tier, opts = {}) {
   const t = tierOf(tier || 'high');
   const pmrem = new THREE.PMREMGenerator(renderer);
   const room = new RoomEnvironment();
-  const rt = pmrem.fromScene(room, 0.04);
-  scene.environment = rt.texture;
-  scene.environmentIntensity = t.envIntensity;
+  const roomRT = pmrem.fromScene(room, 0.04);
+  room.dispose();
+  scene.environment = roomRT.texture;
   scene.background = new THREE.Color('#cfcbc3');
   scene.fog = null;
-  pmrem.dispose();
-  room.dispose();
-  return rt.texture;
+  envScale = ROOM_FACTOR;
+  scene.environmentIntensity = t.envIntensity * envScale;
+  const name = opts.hdr === undefined ? ENV_HDR : opts.hdr;
+  if (!name) { pmrem.dispose(); return Promise.resolve(roomRT.texture); }
+  const url = new URL(`../assets/env/${name}.hdr`, import.meta.url).href;
+  return new Promise((resolve) => {
+    new RGBELoader().load(url, (hdr) => {
+      hdr.mapping = THREE.EquirectangularReflectionMapping;
+      const rt = pmrem.fromEquirectangular(hdr);
+      scene.environment = rt.texture;
+      hdr.dispose(); roomRT.dispose(); pmrem.dispose();
+      envScale = 1;
+      if (envRefresh) envRefresh(); else scene.environmentIntensity = t.envIntensity;
+      resolve(rt.texture);
+    }, undefined, (err) => {
+      console.warn('env.js: HDRI failed to load, keeping RoomEnvironment', err && err.message);
+      pmrem.dispose();
+      resolve(roomRT.texture);
+    });
+  });
 }
 
 // ---------------------------------------------------------------------------
@@ -153,8 +185,12 @@ const LIGHT = {
   sun: 0.5,
   spot: 16,              // candela, counter spot (25 blew the white counter top out)
   hemi: 0.5,             // low tier only
+  shelfStrip: 5,         // 0.3 x 7 strips angled 35 degrees toward the wall shelving (ultra/high only)
   mallWhileInside: 0.65, // fraction of the mall light left once the camera is in the store
 };
+
+const AXIS_Z = new THREE.Vector3(0, 0, 1), SHELF_TILT = (35 * Math.PI) / 180;
+const Q_DOWN = new THREE.Quaternion().setFromAxisAngle(new THREE.Vector3(1, 0, 0), -Math.PI / 2);
 
 function makeStrip(color, intensity, w, h, x, y, z) {
   const l = new THREE.RectAreaLight(color, intensity, w, h);
@@ -183,6 +219,12 @@ export function addLights(scene, tier) {
     for (const x of [-3, 3]) { const l = add(makeStrip(COL_MALL, LIGHT.corridorStrip, 0.6, 10.0, x, 4.48, 6.5)); mall.push({ light: l, base: LIGHT.corridorStrip }); }
     if (t.rectLights === 'full') {
       for (const x of [-6, 0, 6]) { const l = add(makeStrip(COL_MALL, LIGHT.corridorPanel, 0.6, 1.2, x, 4.48, 2)); mall.push({ light: l, base: LIGHT.corridorPanel }); }
+      // Shelf wash: tilted about the world Z axis so product faces on the left/right shelving catch a highlight.
+      for (const side of [-1, 1]) {
+        const l = add(new THREE.RectAreaLight(COL_INTERIOR, LIGHT.shelfStrip, 0.3, 7.0));
+        l.position.set(side * 2.7, 3.3, -5.9);
+        l.quaternion.setFromAxisAngle(AXIS_Z, side * SHELF_TILT).multiply(Q_DOWN);
+      }
     }
   } else {
     add(new THREE.HemisphereLight('#ffffff', '#cfc8bd', LIGHT.hemi));
@@ -221,10 +263,11 @@ export function addLights(scene, tier) {
   const envOut = t.envIntensity, envIn = t.envInterior;
   let k = 0, target = 0, raf = 0, last = 0;
   const apply = () => {
-    const e = k * k * (3 - 2 * k);
-    for (const m of mall) m.light.intensity = m.base * (1 - e * (1 - LIGHT.mallWhileInside));
-    scene.environmentIntensity = envOut + (envIn - envOut) * e;
+    const e = k * k * (3 - 2 * k), f = 1 - e * (1 - LIGHT.mallWhileInside);
+    for (let i = 0; i < mall.length; i++) mall[i].light.intensity = mall[i].base * f;
+    scene.environmentIntensity = (envOut + (envIn - envOut) * e) * envScale;
   };
+  envRefresh = apply;
   const step = (now) => {
     const dt = Math.min((now - last) / 1000, 0.1); last = now;
     const dir = Math.sign(target - k);
@@ -348,24 +391,51 @@ export function materials(T, tier) {
 // ---------------------------------------------------------------------------
 // GTAO that also skips anything tagged userData.noAO and anything see-through (glass, alpha signs).
 class AOPass extends GTAOPass {
-  constructor(...a) { super(...a); this.halfRes = false; }
+  constructor(...a) {
+    super(...a);
+    this.halfRes = false;
+    this._hide = new WeakMap(); // object -> bool, decided once per object (no per-frame allocation)
+    this._hideFn = (o) => { if (o.visible && this._hides(o)) o.visible = false; };
+  }
+  _hides(o) {
+    let v = this._hide.get(o);
+    if (v === undefined) {
+      const m = o.material;
+      v = (o.userData && o.userData.noAO === true) ||
+        (!!m && (Array.isArray(m) ? m.some(seeThrough) : seeThrough(m)));
+      this._hide.set(o, v);
+    }
+    return v;
+  }
   overrideVisibility() {
     super.overrideVisibility();
-    this.scene.traverse((o) => {
-      if (!o.visible) return;
-      const m = o.material;
-      const mats = !m ? [] : Array.isArray(m) ? m : [m];
-      if ((o.userData && o.userData.noAO === true) || mats.some((x) => x.transparent || x.transmission > 0 || x.alphaTest > 0)) o.visible = false;
-    });
+    this.scene.traverse(this._hideFn);
   }
   setSize(w, h) {
     const k = this.halfRes ? 2 : 1;
     super.setSize(Math.max(1, Math.floor(w / k)), Math.max(1, Math.floor(h / k)));
   }
 }
+function seeThrough(x) { return x.transparent || x.transmission > 0 || x.alphaTest > 0; }
+
+// Very subtle vignette + film grain, applied after OutputPass (so on display-encoded values) and before SMAA.
+const GradeShader = {
+  name: 'GradeShader',
+  uniforms: { tDiffuse: { value: null }, time: { value: 0 }, vignette: { value: 0.18 }, grain: { value: 0.015 } },
+  vertexShader: 'varying vec2 vUv; void main(){ vUv = uv; gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0); }',
+  fragmentShader: `
+    uniform sampler2D tDiffuse; uniform float time, vignette, grain; varying vec2 vUv;
+    void main() {
+      vec4 c = texture2D(tDiffuse, vUv);
+      vec2 d = vUv - 0.5;
+      float v = 1.0 - vignette * smoothstep(0.08, 0.5, dot(d, d));
+      float n = fract(sin(dot(vUv * 1731.0 + fract(time) * 97.0, vec2(12.9898, 78.233))) * 43758.5453) - 0.5;
+      gl_FragColor = vec4(c.rgb * v + n * grain, c.a);
+    }`,
+};
 
 /**
- * Composer chain RenderPass -> GTAO -> Bloom -> OutputPass -> SMAA (SMAA runs on tone-mapped output).
+ * Composer chain RenderPass -> GTAO -> Bloom -> OutputPass -> vignette/grain (ultra, high) -> SMAA (SMAA runs on tone-mapped output).
  * Tiers without ao/bloom skip the composer entirely and render straight to the (MSAA) canvas.
  * @returns {{ render(dt), setSize(w,h), setCamera(camera), setTier(tier), readonly composer, readonly passes }}
  */
@@ -379,13 +449,13 @@ export function createPost(renderer, scene, camera, tier) {
   const disposePasses = () => {
     for (const k of Object.keys(passes)) if (passes[k] && passes[k].dispose) passes[k].dispose();
     passes = {};
-    if (composer) { composer.passes.length = 0; }
+    if (composer) composer.passes.length = 0;
   };
   const build = () => {
     renderer.setPixelRatio(effectivePixelRatio(t));
     renderer.shadowMap.enabled = !!t.shadows;
     disposePasses();
-    if (!usesComposer(t)) { if (composer) { composer.renderTarget1.dispose(); composer.renderTarget2.dispose(); composer = null; } return; }
+    if (!usesComposer(t)) { if (composer) { composer.dispose(); composer = null; } return; } // frees both render targets + copy pass
     if (!composer) composer = new EffectComposer(renderer);
     composer.setPixelRatio(renderer.getPixelRatio());
     composer.setSize(w, h);
@@ -408,6 +478,7 @@ export function createPost(renderer, scene, camera, tier) {
     }
     passes.output = new OutputPass();
     composer.addPass(passes.output);
+    if (t.grade) { passes.grade = new ShaderPass(GradeShader); composer.addPass(passes.grade); }
     if (t.smaa) { passes.smaa = new SMAAPass(pw, ph); composer.addPass(passes.smaa); }
   };
   build();
@@ -416,8 +487,10 @@ export function createPost(renderer, scene, camera, tier) {
     get composer() { return composer; },
     get passes() { return passes; },
     render(dt) {
-      if (composer) composer.render(dt);
-      else renderer.render(scene, cam);
+      if (composer) {
+        if (passes.grade) passes.grade.uniforms.time.value += dt || 0.016;
+        composer.render(dt);
+      } else renderer.render(scene, cam);
     },
     setSize(nw, nh) {
       w = nw; h = nh;

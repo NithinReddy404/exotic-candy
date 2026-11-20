@@ -1,0 +1,87 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Exotic Candy & Munchies</title>
+<meta name="description" content="Walk into Exotic Candy & Munchies and browse the menu. Imported candy, international snacks and specialty drinks.">
+<meta name="theme-color" content="#4b2a8a">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Fredoka:wght@500;600;700&family=Nunito:wght@400;600;700;800&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="styles.css">
+<script type="importmap">
+{ "imports": { "three": "https://cdn.jsdelivr.net/npm/three@0.170.0/build/three.module.js" } }
+</script>
+</head>
+<body>
+
+<div id="app">
+  <canvas id="c" tabindex="0" aria-label="3D view of the store. Drag or use arrow keys to look around."></canvas>
+
+  <div id="hud">
+    <div class="top">
+      <div class="chip" id="chip">Exotic Candy &amp; Munchies</div>
+      <div class="top-right">
+        <button id="voice" class="ghost" aria-pressed="false" title="Optional greeting voice">Voice off</button>
+        <button id="skip" class="ghost">Skip tour</button>
+        <button id="outside" class="ghost" hidden>Back outside</button>
+      </div>
+    </div>
+
+    <div id="hint" class="hint">Drag or swipe to look around</div>
+
+    <div id="outside-ui" class="bottom">
+      <button id="see-menu" class="primary">See menu</button>
+    </div>
+
+    <div id="explore-ui" class="bottom" hidden>
+      <button id="to-counter" class="ghost" hidden>Back to counter</button>
+      <button id="open-menu" class="primary">Open menu</button>
+    </div>
+
+    <div id="hotspots" aria-label="Places to look at"></div>
+
+    <div id="bubble" class="bubble" hidden role="status"></div>
+
+    <div id="spot-card" class="card" hidden>
+      <div class="card-title" id="spot-title"></div>
+      <div class="card-body" id="spot-body"></div>
+      <div class="card-actions">
+        <button id="spot-browse" class="primary small"></button>
+      </div>
+    </div>
+  </div>
+
+  <aside id="menu" hidden aria-label="Menu">
+    <div class="menu-head">
+      <div>
+        <div class="menu-store">Exotic Candy &amp; Munchies</div>
+        <div class="menu-sub">Menu</div>
+      </div>
+      <button id="menu-close" class="ghost" aria-label="Close menu">Close</button>
+    </div>
+    <div class="tabs" id="tabs" role="tablist"></div>
+    <div class="menu-body" id="menu-body"></div>
+  </aside>
+
+  <div id="loading" class="loading"><div class="spinner"></div><div id="loading-text">Loading the storefront&hellip;</div></div>
+</div>
+
+<!-- Direct menu view: reduced-motion users and devices without WebGL. -->
+<div id="fallback" hidden>
+  <header class="fb-hero">
+    <div class="fb-sign"><span class="w1">EXOTIC</span> <span class="w2">CANDY</span> <span class="w1">&amp; MUNCHIES</span></div>
+    <p class="fb-tag" id="fb-tagline"></p>
+    <button id="fb-enter" class="primary">Walk into the 3D store</button>
+  </header>
+  <main>
+    <div class="tabs" id="fb-tabs" role="tablist"></div>
+    <div class="menu-body" id="fb-body"></div>
+  </main>
+</div>
+
+<script src="menu.js"></script>
+<script type="module" src="app.js"></script>
+</body>
+</html>

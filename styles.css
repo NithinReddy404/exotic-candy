@@ -157,3 +157,6 @@ button:focus-visible { outline: 3px solid var(--yellow); outline-offset: 2px; }
 .item:hover { border-color: var(--purple); }
 .item img { object-fit: contain; background: #fff; }
 .item .price s { color: var(--muted); font-weight: 600; font-size: 12px; }
+
+.vendors-link { display: block; text-align: center; padding: 10px; font-size: 13px; font-weight: 800; color: var(--purple); text-decoration: none; border-top: 1px solid #ece8f5; }
+.fb-link { color: #fff; font-weight: 700; }

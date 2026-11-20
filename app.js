@@ -491,7 +491,8 @@ canvasEl.addEventListener('pointerdown', (e) => {
   if (walking || transition) return;
   drag = { x: e.clientX, y: e.clientY, yaw: view.yaw, pitch: view.pitch, t: performance.now(), moved: false, lt: performance.now() };
   view.vyaw = view.vpitch = 0;
-  canvasEl.setPointerCapture(e.pointerId); canvasEl.focus({ preventScroll: true });
+  try { canvasEl.setPointerCapture(e.pointerId); } catch {}
+  canvasEl.focus({ preventScroll: true });
 });
 canvasEl.addEventListener('pointermove', (e) => {
   if (drag) {

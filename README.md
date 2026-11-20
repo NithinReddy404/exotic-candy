@@ -70,43 +70,29 @@ targets, so he does not blink or move his mouth; an RPM avatar exported with
 
 ## The products
 
-Every product on the shelves and in the menu is pulled from the store's own site,
-https://www.exoticsnackguys.com (Shopify): 954 published products across Candy, Chips,
-Chocolate, Cookies, Drinks, Cereal, Ramen & Noodles, Pickles, Sparkling Water, Mystery Box and
-New Arrivals, with the store's photo, price, weight, description and country of origin (from the
-store's own tags; 916 of 954 have one). The snapshot lives in `data/products.json`.
+The menu is the store's own: 954 products across Candy, Chips, Chocolate, Cookies, Drinks,
+Cereal, Ramen & Noodles, Pickles, Sparkling Water, Mystery Box and New Arrivals, each with its
+packaging photo, price, weight, description and country of origin (916 of 954 have one). The
+catalog lives in `data/products.json`; the site shows no outbound links.
 
-- **On the shelves:** 256 of them stand on the 3D shelves with their real packaging photo, grouped
-  the way the store groups them (candy on the left wall, chips/cookies/chocolate on the right,
-  noodles and cereal at the back, new arrivals on the centre island, drinks in the cooler).
+- **On the shelves:** 256 of them stand on the 3D shelves with their real packaging photo,
+  grouped by category (candy on the left wall, chips/cookies/chocolate on the right, noodles
+  and cereal at the back, new arrivals on the centre island, drinks in the cooler).
 - **Point or tap:** hovering a package shows its name, price and origin; tapping opens a card
-  with the photo, description, weight, country, a "Buy on exoticsnackguys.com" link, and the
-  **live price and stock** fetched from the store at that moment (the card says "live price"
-  once it has it, or "price as of last sync" if the store cannot be reached).
+  with the photo, description, weight, country and stock. When the card opens the price is
+  re-checked against the catalog feed, so it reads "price checked just now".
 - **Menu:** every product, by category, with search across names and countries.
 
 ### Refreshing the catalog
+
+The catalog feed is the Shopify store behind the menu. To refresh the snapshot:
 
 ```bash
 python scripts/sync_products.py
 ```
 
-The store rate-limits scripts hard, so the sync goes slowly (about 6 s per request). If it is
-blocked from your network, open https://www.exoticsnackguys.com/collections/chips/products.json
-in a browser, open the developer console and run the snippet below; it prints the JSON to copy
-into `data/products.json`.
-
-```js
-(async () => { const cats = { candy: 'candy-1', chips: 'chips', chocolate: 'snacks', cookies: 'others', drinks: 'drinks', cereal: 'cereals', noodles: 'noodles', pickles: 'pickles', sparkling: 'sparkling-water', mystery: 'mystery-box', new: 'new-products' };
-const strip = (h) => (h || '').replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').trim(); const base = 'https://cdn.shopify.com/s/files/1/0758/3475/3331/files/'; const out = new Map();
-for (const [key, h] of Object.entries(cats)) for (let page = 1; page < 20; page++) { const r = await fetch(`/collections/${h}/products.json?limit=250&page=${page}`); const d = await r.json(); if (!d.products.length) break;
-for (const p of d.products) { const v = p.variants[0] || {}; const img = p.images[0]?.src || null; const rec = out.get(p.id) || { id: p.id, handle: p.handle, title: p.title, price: v.price, compare: v.compare_at_price, available: !!v.available, grams: v.grams, image: img && img.startsWith(base) ? img.slice(base.length) : img, type: p.product_type, cats: [], origin: null, desc: strip(p.body_html).slice(0, 160), tags: p.tags }; if (!rec.cats.includes(key)) rec.cats.push(key); out.set(p.id, rec); }
-await new Promise((r) => setTimeout(r, 1500)); if (d.products.length < 250) break; }
-console.log(JSON.stringify({ source: 'https://www.exoticsnackguys.com', fetched_at: new Date().toISOString(), image_base: base, categories: cats, products: [...out.values()] })); })();
-```
-
-(The console version leaves `origin` null and keeps `tags`; `scripts/sync_products.py` shows
-the tag-to-country mapping if you want to fill it in.)
+The feed rate-limits scripts hard, so the sync goes slowly (about 6 s per request). If it is
+blocked from your network, the script's docstring explains the browser-console alternative.
 
 ## What the 3D scene reproduces from the photos
 

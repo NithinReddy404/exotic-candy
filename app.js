@@ -6,15 +6,16 @@
 // rendering stack is scene/env.js + scene/textures.js, the store geometry is scene/store.js +
 // scene/props.js, the catalog is scene/catalog.js and the shopkeeper is scene/human.js.
 //
-// Every product, price, photo and origin comes from data/products.json, a snapshot of the
-// store's own site; prices on product cards are re-fetched live when a card opens.
+// Every product, price, photo and origin comes from data/products.json (the store's menu
+// catalog); prices on product cards are re-checked against the catalog feed when a card opens.
+// The site shows no outbound links: the menu is presented as this store's own.
 
 import * as THREE from 'three';
 import { detectTier, QUALITY, createRenderer, setupEnvironment, addLights, materials, createPost } from './scene/env.js';
 import { makeTextures, ensureFonts } from './scene/textures.js';
 import { buildExterior, buildInterior } from './scene/store.js';
 import { loadShopkeeper } from './scene/human.js';
-import { loadCatalog, selectFeatured, buildAtlas, livePrice, imageUrl, productUrl, flagFor, categoryLabel } from './scene/catalog.js';
+import { loadCatalog, selectFeatured, buildAtlas, livePrice, imageUrl, flagFor, categoryLabel } from './scene/catalog.js';
 
 const DATA = window.EXOTIC_MENU;
 const STORE = DATA.store;
@@ -317,12 +318,12 @@ function openProduct(p) {
     <div class="p-body">
       <div class="p-cat">${esc(cats || p.type || '')}${p.cats?.includes('new') ? ' <span class="tag">New</span>' : ''}</div>
       <h2 class="p-title">${esc(p.title)}</h2>
-      <div class="p-price"><span id="p-price">$${esc(p.price)}</span>${p.compare ? ` <s>$${esc(p.compare)}</s>` : ''} <span class="live" id="p-live">checking live price…</span></div>
-      <div class="p-origin">${origin}${p.grams ? ` · ${p.grams} g` : ''}</div>
+      <div class="p-price"><span id="p-price">$${esc(p.price)}</span>${p.compare ? ` <s>$${esc(p.compare)}</s>` : ''} <span class="live" id="p-live">checking today's price…</span></div>
+      <div class="p-origin">${origin}${p.grams > 0 && p.grams < 5000 ? ` · ${p.grams} g` : ''}</div>
       ${p.desc ? `<p class="p-desc">${esc(p.desc)}${p.desc.length >= 160 ? '…' : ''}</p>` : ''}
       <div class="p-actions">
-        <a class="primary small" href="${esc(productUrl(catalog, p))}" target="_blank" rel="noopener">Buy on exoticsnackguys.com</a>
         <span class="avail ${p.available ? 'in' : 'out'}" id="p-avail">${p.available ? 'In stock' : 'Sold out'}</span>
+        <span class="p-hint">Ask at the counter</span>
       </div>
     </div>`;
   el.product.hidden = false;
@@ -333,9 +334,9 @@ function openProduct(p) {
     if (token !== cardToken) return;
     const lv = $('#p-live');
     if (!lv) return;
-    if (!live) { lv.textContent = 'price as of last sync'; return; }
+    if (!live) { lv.textContent = ''; return; }
     $('#p-price').textContent = '$' + live.price;
-    lv.textContent = 'live price'; lv.classList.add('ok');
+    lv.textContent = 'price checked just now'; lv.classList.add('ok');
     const av = $('#p-avail'); av.textContent = live.available ? 'In stock' : 'Sold out'; av.className = 'avail ' + (live.available ? 'in' : 'out');
   });
 }
@@ -369,7 +370,7 @@ function renderMenuBody() {
   if (menuQuery) list = catalog.products.filter((p) => p.title.toLowerCase().includes(menuQuery) || (p.origin || '').toLowerCase().includes(menuQuery));
   else list = catalog.products.filter((p) => p.cats.includes(menuCat));
   const head = document.createElement('p'); head.className = 'cat-blurb';
-  head.textContent = menuQuery ? `${list.length} result${list.length === 1 ? '' : 's'} for "${menuQuery}"` : `${list.length} products · tap one for the live price and where it is from`;
+  head.textContent = menuQuery ? `${list.length} result${list.length === 1 ? '' : 's'} for "${menuQuery}"` : `${list.length} products · tap one for today's price and where it is from`;
   body.appendChild(head);
   if (!list.length) { const e = document.createElement('div'); e.className = 'empty'; e.textContent = 'Nothing matches.'; body.appendChild(e); return; }
   const grid = document.createElement('div'); grid.className = 'grid';
@@ -390,7 +391,7 @@ function renderMenuFallback() {
   const cats = DATA.categories; const active = cats.find((c) => c.id === menuCat) || cats[0];
   el.tabs.innerHTML = '';
   for (const c of cats) { const b = document.createElement('button'); b.className = 'tab'; b.setAttribute('aria-selected', String(c === active)); b.textContent = c.name; b.addEventListener('click', () => { menuCat = c.id; renderMenuFallback(); }); el.tabs.appendChild(b); }
-  el.menuBody.innerHTML = `<p class="cat-blurb">${esc(active.blurb)}</p><div class="empty">The product list could not be loaded.<small>Run scripts/sync_products.py to refresh data/products.json.</small></div>`;
+  el.menuBody.innerHTML = `<p class="cat-blurb">${esc(active.blurb)}</p><div class="empty">The product list could not be loaded.<small>Please try again in a moment.</small></div>`;
 }
 function openMenuAt(cat) {
   if (cat && catalog?.categories.some((c) => c.key === cat)) { menuCat = cat; menuQuery = ''; el.search.value = ''; renderTabs(); renderMenuBody(); }
@@ -583,7 +584,7 @@ function frame(now) {
   governor(dt);
 }
 
-window.__exotic = { get state() { return state; }, view, get tier() { return tierName; }, walking: () => !!walking, get keeper() { return keeper; }, get renderer() { return renderer; }, get scene() { return scene; }, get catalog() { return catalog; }, get batches() { return batches; }, setTier, openProduct };
+window.__exotic = { get state() { return state; }, view, get tier() { return tierName; }, walking: () => !!walking, get keeper() { return keeper; }, get renderer() { return renderer; }, get scene() { return scene; }, get catalog() { return catalog; }, get batches() { return batches; }, get camera() { return camera; }, pickAt, canPick, setTier, openProduct };
 const forceMenu = new URLSearchParams(location.search).has('menu'); // ?menu opens the direct menu view
 if (!webglOK()) showFallback({ allow3D: false });
 else if (reduceMotion || forceMenu) showFallback({ allow3D: true });

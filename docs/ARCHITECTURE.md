@@ -177,7 +177,7 @@ Use `M.floorTile.clone()` style when a repeat differs. Do not add lights (env.js
 ## C. `scene/human.js` and `assets/`
 
 The shopkeeper is a real rigged human: the Ready Player Me masculine avatar from the open
-animation library (same skeleton as its clips). Base file already at `assets/keeper_base.glb`
+animation library (same skeleton as its clips). Base file (now shipped as `assets/keeper.glb`)
 (2.6 MB, mesh `Wolf3D_Avatar`, bones Hips/Spine/Spine1/Spine2/Neck/Head/LeftEye/RightEye/
 LeftShoulder/LeftArm/LeftForeArm/LeftHand/RightShoulder/.../RightHand, legs; no morph targets).
 Clips: `https://cdn.jsdelivr.net/gh/readyplayerme/animation-library@master/masculine/glb/<folder>/<name>.glb`

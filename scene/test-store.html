@@ -1,0 +1,157 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>props.js / store.js test</title>
+<style>
+  html, body { margin: 0; height: 100%; background: #cfcbc3; overflow: hidden; font: 12px/1.4 system-ui, sans-serif; }
+  canvas { display: block; width: 100%; height: 100%; }
+  #ui { position: fixed; left: 8px; top: 8px; display: flex; flex-wrap: wrap; gap: 4px; max-width: 70vw; }
+  #ui button { font: inherit; padding: 3px 8px; }
+  #info { position: fixed; left: 8px; bottom: 8px; background: rgba(0,0,0,.65); color: #fff; padding: 4px 8px; border-radius: 4px; white-space: pre; }
+</style>
+<script type="importmap">
+{ "imports": { "three": "https://cdn.jsdelivr.net/npm/three@0.170.0/build/three.module.js", "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.170.0/examples/jsm/" } }
+</script>
+</head>
+<body>
+<div id="ui"></div>
+<div id="info"></div>
+<script type="module">
+import * as THREE from 'three';
+import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+import { RoomEnvironment } from 'three/addons/environments/RoomEnvironment.js';
+import { buildExterior, buildInterior } from './store.js';
+
+// ---------------------------------------------------------------- stand-in M (same names as the contract)
+function cv(w, h, draw) { const c = document.createElement('canvas'); c.width = w; c.height = h; draw(c.getContext('2d'), w, h); return c; }
+function tex(c, srgb = true) { const t = new THREE.CanvasTexture(c); if (srgb) t.colorSpace = THREE.SRGBColorSpace; t.wrapS = t.wrapT = THREE.RepeatWrapping; t.anisotropy = 8; return t; }
+const std = (o) => new THREE.MeshStandardMaterial(o);
+
+const WORDS = ['SPICY', 'SOUR', 'CHOCO', 'LIMON', 'COLA', 'GUMMY', 'MANGO', 'TAMARIND', 'CRUNCH', 'MINT', 'BERRY', 'CHILI', 'MATCHA', 'YUZU', 'LYCHEE', 'WASABI'];
+const COLS = ['#e63946', '#ffb703', '#2a9d8f', '#8338ec', '#ff006e', '#3a86ff', '#fb5607', '#06d6a0', '#7209b7', '#ffd166', '#118ab2', '#ef476f', '#80b918', '#f72585', '#4361ee', '#f77f00'];
+const atlas = cv(1024, 1024, (x) => {
+  for (let i = 0; i < 16; i++) {
+    const cx = (i % 4) * 256, cy = Math.floor(i / 4) * 256;
+    x.fillStyle = COLS[i]; x.fillRect(cx, cy, 256, 256);
+    x.fillStyle = 'rgba(255,255,255,.9)'; x.beginPath(); x.arc(cx + 128, cy + 110, 70 + (i % 3) * 8, 0, 7); x.fill();
+    x.fillStyle = COLS[(i + 5) % 16]; x.fillRect(cx + 8, cy + 190, 240, 50);
+    x.fillStyle = '#111'; x.font = '900 40px Arial Black, Arial'; x.textAlign = 'center'; x.fillText(WORDS[i], cx + 128, cy + 125);
+    x.strokeStyle = 'rgba(0,0,0,.35)'; x.lineWidth = 6; x.strokeRect(cx + 14, cy + 14, 228, 228);
+  }
+});
+const labelsMap = tex(atlas); labelsMap.wrapS = labelsMap.wrapT = THREE.ClampToEdgeWrapping;
+const stripes = (a, b) => tex(cv(256, 256, (x) => { x.fillStyle = a; x.fillRect(0, 0, 256, 256); x.fillStyle = b; for (let y = 0; y < 256; y += 20) x.fillRect(0, y, 256, 4); }));
+const gridTex = (a, b, n) => tex(cv(256, 256, (x) => { x.fillStyle = a; x.fillRect(0, 0, 256, 256); x.strokeStyle = b; x.lineWidth = 3; const s = 256 / n; for (let i = 0; i <= n; i++) { x.beginPath(); x.moveTo(i * s, 0); x.lineTo(i * s, 256); x.moveTo(0, i * s); x.lineTo(256, i * s); x.stroke(); } }));
+const signTex = tex(cv(1024, 280, (x) => {
+  x.clearRect(0, 0, 1024, 280); x.textAlign = 'center'; x.textBaseline = 'middle'; x.lineJoin = 'round';
+  const word = (t, px, size, fill, stroke) => { x.font = `700 ${size}px Arial Rounded MT Bold, Arial Black, Arial`; x.lineWidth = size * 0.16; x.strokeStyle = stroke; x.strokeText(t, px, 140); x.fillStyle = fill; x.fillText(t, px, 140); };
+  word('EXOTIC', 175, 100, '#7a3fd3', '#fff'); word('CANDY', 500, 130, '#fff', '#7a3fd3'); word('& MUNCHIES', 850, 80, '#7a3fd3', '#fff');
+}));
+const M = {};
+M.floorTile = new THREE.MeshPhysicalMaterial({ map: gridTex('#e9e3d6', '#c9c2b2', 1), roughness: 0.25, clearcoat: 0.6 });
+M.floorWood = std({ map: stripes('#8d8a85', '#6f6c68'), roughness: 0.7 });
+M.ceiling = std({ map: gridTex('#f2f2ef', '#c9c9c4', 2), roughness: 0.9 });
+M.wallCream = std({ color: '#efe9dc', roughness: 0.85 });
+M.tealSlat = std({ map: stripes('#2ab4c4', '#1b8d9b'), roughness: 0.6 });
+M.whiteSlat = std({ map: stripes('#f4f4f4', '#cfcfcf'), roughness: 0.6 });
+M.white = std({ color: '#f4f4f2', roughness: 0.5 });
+M.black = std({ color: '#121216', roughness: 0.8 });
+M.darkGloss = std({ color: '#1a1b20', roughness: 0.3 });
+M.steel = std({ color: '#b9bcc2', metalness: 0.9, roughness: 0.35 });
+M.aluminum = std({ color: '#cfd2d6', metalness: 0.9, roughness: 0.3 });
+M.glass = new THREE.MeshPhysicalMaterial({ color: '#ffffff', transmission: 0.92, thickness: 0.01, roughness: 0.05, ior: 1.5, transparent: true });
+M.frostedGlass = new THREE.MeshPhysicalMaterial({ color: '#eef6fa', transmission: 0.7, thickness: 0.01, roughness: 0.55, ior: 1.5, transparent: true });
+M.mural = (w, h, v) => std({ map: tex(cv(512, Math.round(512 * h / w) || 128, (x, W, H) => { const g = x.createLinearGradient(0, 0, W, H); g.addColorStop(0, '#8a4de0'); g.addColorStop(1, '#5c2fb0'); x.fillStyle = g; x.fillRect(0, 0, W, H); x.fillStyle = '#2ab4c4'; x.beginPath(); x.moveTo(W * .2, 0); x.lineTo(W * .5, H); x.lineTo(W * .1, H); x.fill(); x.fillStyle = '#ffd23f'; for (let i = 0; i < 8; i++) { x.beginPath(); x.arc(W * (i + .5) / 8, H * (.3 + (i % 3) * .2), H * .14, 0, 7); x.fill(); } })), roughness: 0.8 });
+M.sign = std({ map: signTex, emissive: new THREE.Color('#ffffff'), emissiveMap: signTex, emissiveIntensity: 0.35, transparent: true, alphaTest: 0.5, side: THREE.DoubleSide });
+M.signSide = std({ color: '#2a1456', roughness: 0.7 });
+M.badge = std({ map: tex(cv(512, 512, (x) => { x.clearRect(0, 0, 512, 512); x.fillStyle = '#ff5ea8'; x.beginPath(); x.arc(256, 256, 252, 0, 7); x.fill(); x.fillStyle = '#0c0a14'; x.beginPath(); x.arc(256, 256, 226, 0, 7); x.fill(); x.fillStyle = '#fff'; x.font = '700 90px Arial Black'; x.textAlign = 'center'; x.fillText('CANDY', 256, 280); })), roughness: 0.6, transparent: true });
+M.mat = std({ map: tex(cv(512, 170, (x) => { x.fillStyle = '#111'; x.fillRect(0, 0, 512, 170); x.fillStyle = '#7a3fd3'; for (let i = 0; i < 3; i++) { x.beginPath(); x.arc(90 + i * 166, 85, 60, 0, 7); x.fill(); } })), roughness: 1 });
+M.poster = std({ map: tex(cv(256, 384, (x) => { x.fillStyle = '#2ab4c4'; x.fillRect(0, 0, 256, 384); x.fillStyle = '#7a3fd3'; x.fillRect(0, 0, 256, 150); x.fillStyle = '#fff'; x.font = '700 40px Arial Black'; x.textAlign = 'center'; x.fillText('CANDY', 128, 90); })), roughness: 0.6 });
+M.lightbox = (text) => new THREE.MeshStandardMaterial({ map: tex(cv(1024, 256, (x) => { x.fillStyle = '#f7f9ff'; x.fillRect(0, 0, 1024, 256); x.fillStyle = '#3453d6'; x.font = '700 150px Arial Black'; x.textAlign = 'center'; x.textBaseline = 'middle'; x.fillText(text, 512, 135); })), emissive: new THREE.Color('#ffffff'), emissiveIntensity: 0.6 });
+M.lightPanel = std({ color: '#fff9ee', emissive: new THREE.Color('#fff2d8'), emissiveIntensity: 2.5 });
+M.neighborGlass = std({ color: '#1c2433', roughness: 0.15, metalness: 0.4 });
+M.tablet = std({ color: '#fff', emissive: new THREE.Color('#fff'), emissiveIntensity: 0.5 });
+M.freezerWrap = std({ map: tex(cv(1024, 512, (x) => { const g = x.createLinearGradient(0, 0, 1024, 0); g.addColorStop(0, '#7a3fd3'); g.addColorStop(1, '#2ab4c4'); x.fillStyle = g; x.fillRect(0, 0, 1024, 512); x.fillStyle = '#0c0a14'; x.beginPath(); x.arc(512, 256, 190, 0, 7); x.fill(); })), roughness: 0.5 });
+M.labels = std({ map: labelsMap, roughness: 0.5 }); labelsMap.userData = {}; M.labels.map.repeat.set(1, 1);
+M.product = std({ color: '#ffffff', roughness: 0.45 });
+M.textures = {};
+M.tiled = (mat, rx, ry) => { // clone the material and every texture slot with the same repeat
+  const m = mat.clone();
+  for (const k of ['map', 'normalMap', 'roughnessMap', 'bumpMap', 'aoMap', 'metalnessMap', 'emissiveMap']) {
+    if (mat[k]) { const t = mat[k].clone(); t.wrapS = t.wrapT = THREE.RepeatWrapping; t.repeat.set(rx, ry); t.needsUpdate = true; m[k] = t; }
+  }
+  return m;
+};
+
+// ---------------------------------------------------------------- scene
+const renderer = new THREE.WebGLRenderer({ antialias: true });
+renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
+renderer.setSize(innerWidth, innerHeight);
+renderer.toneMapping = THREE.ACESFilmicToneMapping;
+renderer.shadowMap.enabled = true; renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+document.body.appendChild(renderer.domElement);
+const scene = new THREE.Scene();
+scene.background = new THREE.Color('#cfcbc3');
+const pm = new THREE.PMREMGenerator(renderer);
+scene.environment = pm.fromScene(new RoomEnvironment(), 0.04).texture;
+scene.environmentIntensity = 0.55;
+scene.add(new THREE.HemisphereLight('#ffffff', '#8c8780', 0.5));
+const sun = new THREE.DirectionalLight('#fff4e4', 1.2); sun.position.set(3, 9, 10); sun.castShadow = true;
+sun.shadow.mapSize.set(2048, 2048); Object.assign(sun.shadow.camera, { left: -9, right: 9, top: 12, bottom: -12, near: 1, far: 30 }); scene.add(sun);
+for (const z of [-1.5, -3.7, -5.9, -8.1, -10.3]) for (const x of [-2, 2]) { const l = new THREE.PointLight('#fff1dc', 5, 9, 2); l.position.set(x, 3.2, z); scene.add(l); }
+const spot = new THREE.PointLight('#fff', 6, 6, 2); spot.position.set(-0.3, 2.4, -9.2); scene.add(spot);
+const cooler = new THREE.PointLight('#dff0ff', 3, 3, 2); cooler.position.set(3.0, 1.8, -9.3); scene.add(cooler);
+
+const tier = { name: 'ultra', shadows: true };
+buildExterior(scene, M);
+const interior = buildInterior(scene, M, tier);
+const batches = interior.batches;
+
+const camera = new THREE.PerspectiveCamera(62, innerWidth / innerHeight, 0.05, 80);
+const controls = new OrbitControls(camera, renderer.domElement);
+controls.enableDamping = false;
+const VIEWS = {
+  corridor: [[0.4, 1.62, 5.2], [0, 2.3, 0]],
+  entrance: [[0.2, 1.62, 0.6], [-0.2, 1.4, -8]],
+  counter: [[-0.2, 1.62, -8.3], [-0.3, 1.58, -10.75]],
+  counterTop: [[-0.3, 1.9, -8.6], [-0.3, 1.0, -10.0]],
+  leftWall: [[-1.6, 1.5, -5.2], [-4, 1.1, -6.2]],
+  shelf: [[-2.4, 1.3, -7.2], [-4, 1.0, -7.4]],
+  rightWall: [[1.0, 1.55, -3.0], [4, 1.0, -3.6]],
+  cooler: [[0.8, 1.5, -8.6], [3.6, 1.1, -9.3]],
+  coolerClose: [[1.9, 1.4, -9.0], [3.5, 1.1, -9.3]],
+  gondola: [[0.0, 1.5, -2.2], [-1.4, 0.8, -3.2]],
+  gondolaB: [[-0.2, 1.5, -4.4], [1.4, 0.8, -5.8]],
+  freezer: [[-1.5, 1.55, -0.6], [-3.4, 0.7, -1.6]],
+  backwall: [[0.2, 1.6, -7.5], [-2.8, 1.5, -11]],
+  top: [[0, 16, -4], [0, 0, -4.01]],
+  mall: [[-4.5, 2.2, 7.5], [0, 2.4, 0]],
+  sign: [[0.6, 1.2, 1.8], [0, 3.1, 0.4]],
+};
+window.setView = (name) => {
+  const v = VIEWS[name]; if (!v) return;
+  camera.position.set(...v[0]); controls.target.set(...v[1]); controls.update();
+};
+const ui = document.getElementById('ui');
+for (const k of Object.keys(VIEWS)) { const b = document.createElement('button'); b.textContent = k; b.onclick = () => setView(k); ui.appendChild(b); }
+setView(new URLSearchParams(location.search).get('view') || 'corridor');
+
+window.THREE = THREE; window.__batches = batches; window.__scene = scene;
+const st = batches.stats();
+window.__stats = { ...st, renderer: null };
+addEventListener('resize', () => { camera.aspect = innerWidth / innerHeight; camera.updateProjectionMatrix(); renderer.setSize(innerWidth, innerHeight); });
+const info = document.getElementById('info');
+let n = 0;
+renderer.setAnimationLoop(() => {
+  renderer.info.reset();
+  renderer.render(scene, camera);
+  if ((n++ % 30) === 0) {
+    window.__stats.renderer = { calls: renderer.info.render.calls, tris: renderer.info.render.triangles };
+    info.textContent = `products: ${st.instances} instances, ${st.triangles} tris, ${st.meshes} meshes\nrender: ${renderer.info.render.calls} calls, ${renderer.info.render.triangles} tris`;
+  }
+});
+</script>
+</body>
+</html>
